@@ -286,6 +286,8 @@ describe("plugin session extension SessionEntry projection", () => {
       "sandbox-policy": "sandbox",
       "pending-final-text": "pendingFinalDeliveryText",
       "completion-custody": "restartRecoveryHarnessCompletion",
+      "retained-history": "retainedHistoryReferences",
+      "retired-compaction-checkpoints": "compactionCheckpoints",
       "retired-execsecurity": "execSecurity",
       "retired-execask": "execAsk",
     };
