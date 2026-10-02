@@ -464,16 +464,32 @@ describe("doctor canonical session-key repair", () => {
     });
   });
 
-  it("rehomes suggestions from a stale same-store alias", async () => {
+  it("rehomes suggestions and retained history from a stale same-store alias", async () => {
     await withStateDirEnv("openclaw-doctor-canonical-suggestions-", async ({ stateDir }) => {
       const { cfg, env, storePath } = createMainStoreFixture(stateDir, "work");
-      replaceSessionEntrySync(
-        { agentId: "main", env, sessionKey: "agent:main:work", storePath },
-        { sessionId: "winner", updatedAt: 20 },
-      );
+      const winnerArtifact = path.join(stateDir, "winner-history.jsonl");
+      const aliasArtifact = path.join(stateDir, "alias-history.jsonl");
       insertLegacySession({
         agentId: "main",
-        entry: { sessionId: "stale-alias", updatedAt: 10 },
+        env,
+        sessionKey: "agent:main:work",
+        storePath,
+        entry: {
+          sessionId: "winner",
+          updatedAt: 20,
+          retainedHistoryReferences: { sessionIds: ["winner"], artifactPaths: [winnerArtifact] },
+        },
+      });
+      insertLegacySession({
+        agentId: "main",
+        entry: {
+          sessionId: "stale-alias",
+          updatedAt: 10,
+          retainedHistoryReferences: {
+            sessionIds: ["stale-alias"],
+            artifactPaths: [aliasArtifact],
+          },
+        },
         env,
         sessionKey: "main",
         storePath,
@@ -503,6 +519,22 @@ describe("doctor canonical session-key repair", () => {
       expect(database.db.prepare("SELECT identity_id FROM session_members").all()).toEqual([
         { identity_id: "canonical-member" },
       ]);
+      expect(
+        loadExactSessionEntryReadOnly({
+          agentId: "main",
+          env,
+          sessionKey: "agent:main:work",
+          storePath,
+        })?.entry.retainedHistoryReferences,
+      ).toEqual({
+        sessionIds: ["winner", "stale-alias"],
+        artifactPaths: [winnerArtifact, aliasArtifact],
+      });
+      expect(
+        database.db
+          .prepare("SELECT session_key FROM session_windows WHERE session_id = ?")
+          .get("stale-alias"),
+      ).toEqual({ session_key: "agent:main:work" });
     });
   });
 

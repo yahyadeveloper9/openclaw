@@ -23,6 +23,7 @@ import {
 } from "./legacy-main-session-key-scan.js";
 import { claimsMatch, restoreColdSessionClaims } from "./legacy-main-session-migration-claims.js";
 import {
+  assertLegacyMainSessionHistoryCustody,
   processIdenticalClaims,
   repairDivergentClaims,
   samePhysicalStore,
@@ -492,6 +493,15 @@ async function migrateLegacyMainSessionKeysInternal(
   }
   for (const [canonicalKey, aliases] of byCanonical) {
     const canonicalClaims = allCanonical.filter((claim) => claim.key === canonicalKey);
+    if (params.mode === "doctor-fix") {
+      assertLegacyMainSessionHistoryCustody({
+        claims: [...canonicalClaims, ...aliases],
+        destination,
+        destinationCanonical: canonicalClaims.find((claim) =>
+          samePhysicalStore(claim.store, destination),
+        ),
+      });
+    }
     if (
       params.mode === "doctor-fix" &&
       [...aliases, ...canonicalClaims].some(

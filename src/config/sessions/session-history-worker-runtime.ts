@@ -261,7 +261,6 @@ function captureHistoryRequest(request: SessionHistoryWorkerRequest): SessionHis
       kind: "rpc",
       params: {
         encodeResponse: params.encodeResponse,
-        compactionMetrics: params.compactionMetrics?.map((metric) => ({ ...metric })),
         entry: capturedEntry,
         provider: params.provider,
         sessionId: params.sessionId,

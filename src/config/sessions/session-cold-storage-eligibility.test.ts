@@ -142,31 +142,20 @@ describe("cold-storage protection selection", () => {
       pinnedAt: 3,
       previousSessionId: "previous",
       usageFamilySessionIds: ["idle", "usage"],
-      compactionCheckpoints: [
-        {
-          sessionId: "checkpoint",
-          preCompaction: { sessionId: "before" },
-          postCompaction: { sessionId: "after" },
-        },
-      ],
+      retainedHistoryReferences: {
+        sessionIds: ["checkpoint", "before", "after"],
+        artifactPaths: [],
+      },
     });
     expect(protect()).toEqual(new Set(["previous", "usage", "checkpoint", "before", "after"]));
   });
 
-  it("does not let legacy checkpoint self-references protect an idle current window", () => {
+  it("does not let retained history self-references protect an idle current window", () => {
     addNode("idle", {
-      compactionCheckpoints: [
-        {
-          sessionId: "idle",
-          preCompaction: { sessionId: "idle" },
-          postCompaction: { sessionId: "idle" },
-        },
-        {
-          sessionId: "idle",
-          preCompaction: { sessionId: "older-generation" },
-          postCompaction: { sessionId: "idle" },
-        },
-      ],
+      retainedHistoryReferences: {
+        sessionIds: ["idle", "older-generation"],
+        artifactPaths: [],
+      },
     });
     expect(protect()).toEqual(new Set(["older-generation"]));
     database

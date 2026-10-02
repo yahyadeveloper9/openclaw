@@ -169,19 +169,10 @@ describe("chat.history cursor catch-up", () => {
     for (const [index, event] of oldEvents.entries()) {
       event.parentId = oldEvents[index - 1]?.id ?? null;
     }
-    const { context, storePath } = await createCursorSession(
-      [{ type: "session", version: 3, id: sessionId }, ...oldEvents],
-      {
-        compactionCheckpoints: [
-          {
-            preCompaction: { sessionId },
-            postCompaction: { sessionId, entryId: "fresh-compaction" },
-            tokensBefore: 42_000,
-            tokensAfter: 8_000,
-          },
-        ],
-      },
-    );
+    const { context, storePath } = await createCursorSession([
+      { type: "session", version: 3, id: sessionId },
+      ...oldEvents,
+    ]);
     const scope = currentScope(storePath);
     await appendTranscriptEvent(scope, {
       type: "compaction",
@@ -277,6 +268,8 @@ describe("chat.history cursor catch-up", () => {
       parentId,
       summary: "fresh summary",
       firstKeptEntryId: "fresh-user-3",
+      tokensBefore: 42_000,
+      tokensAfter: 8_000,
       timestamp: new Date().toISOString(),
     });
     expect(await callChat(context, "chat.history", { cursor })).toMatchObject({

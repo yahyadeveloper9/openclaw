@@ -218,6 +218,7 @@ export async function runDoctorSessionSqlite(
               )
             ).targets[0]!
           : await inspectOrMigrateTarget({
+              authority,
               configuredAgentIds,
               cfg,
               env,
@@ -257,6 +258,7 @@ export async function runDoctorSessionSqlite(
   for (const target of targets) {
     reports.push(
       await inspectOrMigrateTarget({
+        authority,
         configuredAgentIds,
         activeRun,
         archiveTargets,
@@ -694,6 +696,7 @@ export async function reconcileDoctorSessionSqlitePublication(
 }
 
 async function inspectOrMigrateTarget(params: {
+  authority?: DoctorSqliteMaintenanceAuthority;
   configuredAgentIds: ReadonlySet<string>;
   verifyMissingIndex: ReturnType<typeof createMissingSessionIndexVerifier>;
   historicalArchives?: HistoricalArchiveSources;

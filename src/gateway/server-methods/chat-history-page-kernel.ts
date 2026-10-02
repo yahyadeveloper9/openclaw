@@ -1,5 +1,3 @@
-import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
-import { readLegacyCompactionMetrics } from "../../config/sessions/legacy-compaction-history.js";
 import type {
   ChatHistoryPage,
   ChatHistoryPageParams,
@@ -88,45 +86,6 @@ function resolveChatHistoryActiveLeafEntryId(
     return readPage.activeLeafEntryId ?? null;
   }
   return resolveSessionTranscriptActiveLeafEntryId(readPage.transcriptEvents ?? []) ?? null;
-}
-
-/** Preserve token metrics saved by pre-removal builds; new markers own their metrics. */
-export function enrichChatHistoryCompactionMarkers(
-  messages: unknown[],
-  entry: ChatHistoryPageParams["entry"],
-  metrics = readLegacyCompactionMetrics(entry),
-): unknown[] {
-  if (metrics.length === 0) {
-    return messages;
-  }
-  const checkpointByEntryId = new Map(metrics.map((metric) => [metric.entryId, metric]));
-  let changed = false;
-  const enriched = messages.map((message) => {
-    const record = asOptionalRecord(message);
-    const metadata = asOptionalRecord(record?.["__openclaw"]);
-    if (metadata?.kind !== "compaction" || typeof metadata.id !== "string") {
-      return message;
-    }
-    const checkpoint = checkpointByEntryId.get(metadata.id);
-    if (!checkpoint) {
-      return message;
-    }
-    const tokensBefore = checkpoint.tokensBefore;
-    const tokensAfter = checkpoint.tokensAfter;
-    if (tokensBefore === undefined && tokensAfter === undefined) {
-      return message;
-    }
-    changed = true;
-    return {
-      ...record,
-      __openclaw: {
-        ...metadata,
-        ...(tokensBefore !== undefined ? { tokensBefore } : {}),
-        ...(tokensAfter !== undefined ? { tokensAfter } : {}),
-      },
-    };
-  });
-  return changed ? enriched : messages;
 }
 
 function resolveChatHistoryMessageGroup(

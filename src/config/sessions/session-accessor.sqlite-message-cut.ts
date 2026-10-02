@@ -333,7 +333,10 @@ function mutateSqliteSessionAtMessageInTransaction(
       ? { incognito: true as const }
       : {}),
   };
-  writeSessionEntry(database, params.targetKey, nextEntry);
+  writeSessionEntry(database, params.targetKey, nextEntry, {
+    retainedHistoryReferencesFromOwner:
+      params.mode === "fork" ? undefined : currentEntry.retainedHistoryReferences,
+  });
   return {
     status: "created",
     key: params.targetKey,

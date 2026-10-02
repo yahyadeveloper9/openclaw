@@ -20,7 +20,7 @@ import { formatSessionArchiveTimestamp } from "./artifacts.js";
 import { enforceSessionDiskBudget, measureSessionPhysicalDiskUsage } from "./disk-budget.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 import { resolveMaintenanceConfigFromInput } from "./store-maintenance.js";
-import type { SessionEntry } from "./types.js";
+import type { InternalSessionEntry, SessionEntry } from "./types.js";
 
 async function expectPathExists(targetPath: string): Promise<void> {
   await fs.access(targetPath);
@@ -616,29 +616,17 @@ describe("enforceSessionDiskBudget", () => {
       );
       const referencedCheckpointPath = path.join(
         dir,
-        "keep.checkpoint.22222222-2222-4222-8222-222222222222.jsonl",
+        "..keep.checkpoint.22222222-2222-4222-8222-222222222222.jsonl",
       );
       const referencedPostCompactionPath = path.join(dir, "keep-compacted.jsonl");
-      // Historical metadata is deliberately outside the current session model.
-      const store = {
+      const store: Record<string, InternalSessionEntry> = {
         "agent:main:main": {
           sessionId,
           updatedAt: Date.now(),
-          compactionCheckpoints: [
-            {
-              checkpointId: "referenced",
-              sessionKey: "agent:main:main",
-              sessionId,
-              createdAt: Date.now(),
-              reason: "manual",
-              preCompaction: {
-                sessionId,
-                sessionFile: referencedCheckpointPath,
-                leafId: "leaf",
-              },
-              postCompaction: { sessionId, sessionFile: referencedPostCompactionPath },
-            },
-          ],
+          retainedHistoryReferences: {
+            sessionIds: [sessionId],
+            artifactPaths: [referencedCheckpointPath, referencedPostCompactionPath],
+          },
         },
       };
       await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
@@ -646,6 +634,7 @@ describe("enforceSessionDiskBudget", () => {
       await fs.writeFile(checkpointPath, "c".repeat(5000), "utf-8");
       await fs.writeFile(referencedCheckpointPath, "r".repeat(260), "utf-8");
       await fs.writeFile(referencedPostCompactionPath, "p".repeat(260), "utf-8");
+      await fs.utimes(referencedCheckpointPath, 1, 1);
 
       const result = await enforceSessionDiskBudget({
         store,

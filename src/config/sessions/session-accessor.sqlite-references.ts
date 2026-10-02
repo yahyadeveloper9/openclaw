@@ -7,14 +7,13 @@ import {
 } from "../../infra/kysely-sync.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
-import { readLegacyCompactionHistory } from "./legacy-compaction-history.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import { parseSessionEntryJson } from "./session-accessor.sqlite-status.js";
 import {
   isRecentSessionMaintenanceEntry,
   isSessionEntryDiskBudgetEvictable,
 } from "./store-maintenance.js";
-import type { SessionEntry } from "./types.js";
+import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 /** Every transcript generation retained by one canonical logical-session record. */
 export function collectSessionStateIdsForEntry(entry: SessionEntry): string[] {
@@ -30,10 +29,8 @@ export function collectSessionStateIdsForEntry(entry: SessionEntry): string[] {
   for (const sessionId of entry.usageFamilySessionIds ?? []) {
     add(sessionId);
   }
-  for (const checkpoint of readLegacyCompactionHistory(entry)) {
-    add(checkpoint.sessionId);
-    add(checkpoint.preCompaction.sessionId);
-    add(checkpoint.postCompaction.sessionId);
+  for (const sessionId of entry.retainedHistoryReferences?.sessionIds ?? []) {
+    add(sessionId);
   }
   return uniqueStrings(sessionIds);
 }

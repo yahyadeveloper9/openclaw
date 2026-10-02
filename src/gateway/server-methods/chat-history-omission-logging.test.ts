@@ -13,7 +13,7 @@ function runHistoryBudgetPipeline(messages: unknown[], maxHistoryBytes: number) 
   try {
     const page = prepareChatHistoryResponsePage(
       { messages },
-      { entry: undefined, messageId: undefined, maxHistoryBytes },
+      { messageId: undefined, maxHistoryBytes },
     );
     if (page.omission) {
       reportOmittedChatHistory({ ...page.omission, maxHistoryBytes, logDebug: () => {} });

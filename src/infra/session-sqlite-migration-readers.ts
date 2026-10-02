@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { TextDecoder } from "node:util";
+import { isDeepStrictEqual, TextDecoder } from "node:util";
 import { safeStatSync } from "@openclaw/fs-safe/path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
@@ -170,7 +170,8 @@ export function createTranscriptEventReader(
   allowMalformedPrefix = false,
   sourceFingerprint = readTranscriptFingerprint(transcriptPath),
   originalSourcePath = transcriptPath,
-): (append: (event: TranscriptEvent) => void) => () => void {
+  options: { preserveEventJson?: boolean } = {},
+): (append: (event: TranscriptEvent, eventJson?: string) => void) => () => void {
   return (append) => {
     // Production import owns the process-wide Gateway/SQLite-maintenance lock
     // through commit and archive. Fingerprints catch non-cooperating external edits.
@@ -192,10 +193,12 @@ export function createTranscriptEventReader(
       resolveOriginalEntryId: (originalIndex) => migratedTargetIds.get(originalIndex),
       sourceVersion: plan.sourceVersion,
     };
-    for (const { event: loadedEvent, originalIndex } of iterateTranscriptEvents(
-      transcriptPath,
-      allowMalformedPrefix,
-    )) {
+    for (const {
+      event: loadedEvent,
+      originalIndex,
+      eventJson,
+      originalEvent,
+    } of iterateTranscriptEvents(transcriptPath, allowMalformedPrefix, options.preserveEventJson)) {
       let event = loadedEvent;
       if (plan.sourceVersion >= 2) {
         recordLegacyCompactionTarget(event, plan.compactionTargetIndexes);
@@ -229,7 +232,10 @@ export function createTranscriptEventReader(
         }
         event = recognizedEvent;
       }
-      append(event as TranscriptEvent);
+      append(
+        event as TranscriptEvent,
+        eventJson !== undefined && isDeepStrictEqual(originalEvent, event) ? eventJson : undefined,
+      );
     }
     assertTranscriptFileUnchanged(transcriptPath, sourceFingerprint);
     return () => assertTranscriptFileUnchanged(transcriptPath, sourceFingerprint);
@@ -263,7 +269,7 @@ export function readTranscriptFingerprint(transcriptPath: string): TranscriptFil
   };
 }
 
-function assertTranscriptFileUnchanged(
+export function assertTranscriptFileUnchanged(
   transcriptPath: string,
   expected: TranscriptFileFingerprint,
 ): void {
@@ -328,7 +334,13 @@ function recordLegacyCompactionTarget(event: FileEntry, targets: Set<number>): v
 function* iterateTranscriptEvents(
   transcriptPath: string,
   allowMalformedPrefix: boolean,
-): Generator<{ event: FileEntry; originalIndex: number }> {
+  preserveEventJson = false,
+): Generator<{
+  event: FileEntry;
+  originalIndex: number;
+  eventJson?: string;
+  originalEvent?: unknown;
+}> {
   let originalIndex = 0;
   try {
     for (const line of iterateJsonlLinesSync(transcriptPath)) {
@@ -336,9 +348,11 @@ function* iterateTranscriptEvents(
       if (!parsed) {
         continue;
       }
+      const originalEvent = preserveEventJson ? structuredClone(parsed) : undefined;
       yield {
         event: normalizeLoadedFileEntry(parsed as FileEntry),
         originalIndex,
+        ...(preserveEventJson ? { eventJson: line, originalEvent } : {}),
       };
       originalIndex += 1;
     }

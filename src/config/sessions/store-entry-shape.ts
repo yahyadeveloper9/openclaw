@@ -8,8 +8,12 @@ import {
 import { normalizeSessionConversationLink } from "./conversation-link.js";
 import { SessionStoreMigrationRequiredError } from "./migration-required.js";
 import { hasLegacySessionEntryState } from "./session-entry-state-format.js";
+import { assertCanonicalRetainedHistoryReferences } from "./session-retained-history.js";
 import { assertSupportedSessionStoreEntry } from "./supported-session-store.js";
-import type { PendingTranscriptRepairState, SessionEntry } from "./types.js";
+import type {
+  PendingTranscriptRepairState,
+  InternalSessionEntry as SessionEntry,
+} from "./types.js";
 
 function normalizeSessionEntryArchiveReason(
   value: unknown,
@@ -35,6 +39,7 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
       "Legacy session entry state requires migration; stop the Gateway and run openclaw doctor --fix.",
     );
   }
+  assertCanonicalRetainedHistoryReferences(value.retainedHistoryReferences);
   const {
     sessionFile: _retiredSessionFile,
     transcriptPath: _retiredTranscriptPath,

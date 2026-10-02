@@ -1,8 +1,12 @@
 import fs from "node:fs";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { registerOpenClawAgentDatabaseAsyncResource } from "../../state/openclaw-agent-db-resources.js";
-import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import {
+  openOpenClawAgentDatabase,
+  runOpenClawAgentWriteTransaction,
+} from "../../state/openclaw-agent-db.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { deliveryContextFromSession } from "../../utils/delivery-context.read.js";
 import {
@@ -19,6 +23,7 @@ import {
   switchSessionBranch,
   updateSessionEntry,
 } from "./session-accessor.js";
+import { writeSessionEntry } from "./session-accessor.sqlite-entry-store.js";
 import {
   agentId,
   sessionKey,
@@ -31,6 +36,22 @@ import { waitForSessionTranscriptProjection } from "./session-transcript-reconci
 import type { InternalSessionEntry } from "./types.js";
 
 const { createSession } = useSessionMessageCutFixtures();
+
+function retainSessionHistory(scope: Awaited<ReturnType<typeof createSession>>["scope"]) {
+  const entry = expectDefined(loadSessionEntry(scope), "message-cut source");
+  const retainedHistoryReferences = { sessionIds: [scope.sessionId], artifactPaths: [] };
+  runOpenClawAgentWriteTransaction(
+    (database) =>
+      writeSessionEntry(
+        database,
+        scope.sessionKey,
+        { ...entry, retainedHistoryReferences },
+        { allowStoredAliases: true },
+      ),
+    scope,
+  );
+  return retainedHistoryReferences;
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -175,17 +196,7 @@ describe("SQLite session message cuts", () => {
 
   it("rewinds by repointing the active leaf and returns the editor text", async () => {
     const { env, scope } = await createSession();
-    const legacyCheckpoints = [
-      {
-        sessionId: scope.sessionId,
-        preCompaction: { sessionId: scope.sessionId },
-        postCompaction: { sessionId: scope.sessionId },
-      },
-    ];
-    await updateSessionEntry(scope, (entry) => ({
-      ...entry,
-      compactionCheckpoints: legacyCheckpoints,
-    }));
+    const retainedHistoryReferences = retainSessionHistory(scope);
 
     const canonicalKey = "agent:main:canonical-message-cut";
     const result = await rewindSessionToMessage({
@@ -216,7 +227,7 @@ describe("SQLite session message cuts", () => {
     ).toBe(2);
     expect(loadSessionEntry({ agentId, env, sessionKey })?.sessionId).toBe(result.entry.sessionId);
     expect(loadSessionEntry({ agentId, env, sessionKey: canonicalKey })).toBeUndefined();
-    expect(loadSessionEntry(scope)).toHaveProperty("compactionCheckpoints", legacyCheckpoints);
+    expect(loadSessionEntry(scope)?.retainedHistoryReferences).toEqual(retainedHistoryReferences);
     expect(result.entry).toMatchObject({
       agentHarnessId: undefined,
       claudeCliSessionId: undefined,
@@ -266,17 +277,7 @@ describe("SQLite session message cuts", () => {
 
   it("forks an exact active-path prefix without changing the source", async () => {
     const { env, scope } = await createSession();
-    const legacyCheckpoints = [
-      {
-        sessionId: scope.sessionId,
-        preCompaction: { sessionId: scope.sessionId },
-        postCompaction: { sessionId: scope.sessionId },
-      },
-    ];
-    await updateSessionEntry(scope, (entry) => ({
-      ...entry,
-      compactionCheckpoints: legacyCheckpoints,
-    }));
+    const retainedHistoryReferences = retainSessionHistory(scope);
     const canonicalSourceKey = "agent:main:canonical-message-cut-source";
     const targetKey = "agent:main:dashboard:message-cut-fork";
     recordSessionParticipant(scope, {
@@ -318,9 +319,9 @@ describe("SQLite session message cuts", () => {
       ),
     ).toEqual([result.entry.sessionId, "user-1", "assistant-1"]);
     expect(loadSessionEntry(scope)?.sessionId).toBe(scope.sessionId);
-    expect(loadSessionEntry(scope)).toHaveProperty("compactionCheckpoints", legacyCheckpoints);
+    expect(loadSessionEntry(scope)?.retainedHistoryReferences).toEqual(retainedHistoryReferences);
     expect(loadSessionEntry({ agentId, env, sessionKey: targetKey })).not.toHaveProperty(
-      "compactionCheckpoints",
+      "retainedHistoryReferences",
     );
     expect(listSessionParticipantsReadOnly({ agentId, env }).get(targetKey)).toBeUndefined();
     expect(listSessionParticipantsReadOnly({ agentId, env }).get(sessionKey)).toEqual([

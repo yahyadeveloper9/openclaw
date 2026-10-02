@@ -8,6 +8,7 @@ import {
   type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
+import { SessionStoreMigrationRequiredError } from "./migration-required.js";
 import { readSessionEntryCache } from "./session-accessor.sqlite-entry-cache.js";
 import { iterateSessionEntryKeys } from "./session-accessor.sqlite-entry-inventory.js";
 import {
@@ -396,14 +397,11 @@ describe("SQLite candidate reference reads", () => {
           updatedAt: 1,
           previousSessionId: ` ${ids[1]} `,
           usageFamilySessionIds: [ids[2]],
-          compactionCheckpoints: [
-            {
-              sessionId: ids[3],
-              preCompaction: { sessionId: ids[4] },
-              postCompaction: { sessionId: ids[5] },
-              unrelated: { nested: [{ sessionId: "not-a-reference" }] },
-            },
-          ],
+          retainedHistoryReferences: {
+            sessionIds: [ids[3], ids[4], ids[5]],
+            artifactPaths: [],
+          },
+          unrelated: { nested: [{ sessionId: "not-a-reference" }] },
           skillsSnapshot: { prompt: "large saved prompt".repeat(1024), skills: [] },
         }),
       );
@@ -452,8 +450,8 @@ describe("SQLite candidate reference reads", () => {
       '"sessionId":"wrong","sessionId":"current","previousSessionId":"candidate"',
     ],
     [
-      "duplicate checkpoint",
-      '"compactionCheckpoints":[{"sessionId":"wrong","sessionId":"candidate","preCompaction":{},"postCompaction":{}}]',
+      "duplicate retained history",
+      '"retainedHistoryReferences":{"sessionIds":["wrong"],"sessionIds":["candidate"],"artifactPaths":[]}',
     ],
     [
       "overdepth",
@@ -470,17 +468,21 @@ describe("SQLite candidate reference reads", () => {
     );
   });
 
-  it.each(['"previousSessionId":1', '"usageFamilySessionIds":[1]', '"compactionCheckpoints":[{}]'])(
-    "retains parser failures for malformed references: %s",
-    (fields) => {
-      const database = openDatabase();
-      insertEntry(database, "owner", "current", `{"sessionId":"current","updatedAt":1,${fields}}`);
-      expect(() => readReferencedSessionIds(database, undefined, ["candidate"])).toThrow(TypeError);
-      expect(readReferencedSessionIds(database, new Set(["owner"]), ["candidate"])).toEqual(
-        new Set(),
-      );
+  it.each([
+    { fields: '"previousSessionId":1', error: TypeError },
+    { fields: '"usageFamilySessionIds":[1]', error: TypeError },
+    {
+      fields: '"retainedHistoryReferences":{"sessionIds":[1],"artifactPaths":[]}',
+      error: SessionStoreMigrationRequiredError,
     },
-  );
+  ])("retains parser failures for malformed references: $fields", ({ fields, error }) => {
+    const database = openDatabase();
+    insertEntry(database, "owner", "current", `{"sessionId":"current","updatedAt":1,${fields}}`);
+    expect(() => readReferencedSessionIds(database, undefined, ["candidate"])).toThrow(error);
+    expect(readReferencedSessionIds(database, new Set(["owner"]), ["candidate"])).toEqual(
+      new Set(),
+    );
+  });
 
   it.each(["UTF-8", "UTF-16le"] as const)(
     "protects raw current IDs after %s text conversion",

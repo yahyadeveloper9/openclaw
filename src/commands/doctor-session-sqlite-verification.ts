@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { resolveLegacyTranscriptPaths } from "../config/sessions/legacy-store-inspection.js";
+import type { DoctorCompactionTranscriptTransform } from "../config/sessions/session-accessor.sqlite-import-stage.js";
 import { getSessionKysely } from "../config/sessions/session-accessor.sqlite-scope.js";
 import {
   attachSessionEntrySnapshots,
@@ -36,9 +37,14 @@ import { normalizeLegacySessionEntryDelivery } from "../infra/state-migrations.l
 import { migrateLegacySessionCreator } from "../state/creator-namespace-migration.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
 import { inspectOpenClawAgentDatabaseOwner } from "../state/openclaw-agent-db.js";
+import {
+  createLegacyCompactionTranscriptTransform,
+  prepareLegacySessionCompactionHistory,
+} from "./doctor-session-compaction-history.js";
 import type { LegacySessionRecord } from "./doctor-session-sqlite-discovery.js";
 import type { DoctorSessionSqliteTargetReport } from "./doctor-session-sqlite-types.js";
 import { assertDoctorSqliteMaintenancePathsNotAliased } from "./doctor-sqlite-maintenance-lock.js";
+import { normalizePersistedSessionEntryShape } from "./doctor/shared/session-entry-shape.js";
 
 /** Keep one owner proof per database; fence in-place writes and sidecar changes after awaits. */
 export function createRecoveryDestinationVerifier(stateDir: string) {
@@ -120,6 +126,11 @@ export function verifyHistoricalMigrationArtifact(params: {
   if (!isRecord(index)) {
     return undefined;
   }
+  const eventFacts = Object.values(index).flatMap((raw) =>
+    isRecord(raw) ? prepareLegacySessionCompactionHistory(raw).eventFacts : [],
+  );
+  const doctorCompactionTranscriptTransform =
+    eventFacts.length > 0 ? createLegacyCompactionTranscriptTransform(eventFacts) : undefined;
   const entries =
     move.kind === "legacy-store"
       ? Object.entries(index)
@@ -167,7 +178,16 @@ export function verifyHistoricalMigrationArtifact(params: {
         }
         attachSessionEntrySnapshots(current, row);
         const entry: SessionEntry = { ...raw, sessionId, updatedAt: raw.updatedAt };
-        const normalized = migrateLegacySessionCreator(normalizeLegacySessionEntryDelivery(entry));
+        const compactionPlan = prepareLegacySessionCompactionHistory(entry);
+        const canonical = normalizePersistedSessionEntryShape(compactionPlan.entry, {
+          sessionKey: key,
+        });
+        if (!canonical || Object.hasOwn(current, "compactionCheckpoints")) {
+          return false;
+        }
+        const normalized = migrateLegacySessionCreator(
+          normalizeLegacySessionEntryDelivery(canonical),
+        );
         if (
           Object.entries(normalized).some(
             ([field, value]) =>
@@ -188,6 +208,7 @@ export function verifyHistoricalMigrationArtifact(params: {
           path: move.archivePath,
           originalPath: move.sourcePath,
           sessionId,
+          doctorCompactionTranscriptTransform,
         });
         if (!complete) {
           return false;
@@ -220,6 +241,11 @@ export function validateLegacySessionRecords(
     return true;
   }
   const issueCountBeforeValidation = report.issues.length;
+  const eventFacts = records.flatMap(
+    (record) => prepareLegacySessionCompactionHistory({ ...record.entry }).eventFacts,
+  );
+  const doctorCompactionTranscriptTransform =
+    eventFacts.length > 0 ? createLegacyCompactionTranscriptTransform(eventFacts) : undefined;
   const validation = readOnlySqliteValidationSnapshot(target);
   if (!validation.ok) {
     report.issues.push({
@@ -229,7 +255,14 @@ export function validateLegacySessionRecords(
     return false;
   }
   for (const record of records) {
-    validateLegacySessionRecord(record, report, validation.snapshot, purpose, env);
+    validateLegacySessionRecord(
+      record,
+      report,
+      validation.snapshot,
+      purpose,
+      env,
+      doctorCompactionTranscriptTransform,
+    );
   }
   return report.issues.length === issueCountBeforeValidation;
 }
@@ -240,6 +273,7 @@ function validateLegacySessionRecord(
   snapshot: ReadOnlySqliteValidationSnapshot,
   purpose: "validate" | "before-archive",
   env: NodeJS.ProcessEnv,
+  doctorCompactionTranscriptTransform: DoctorCompactionTranscriptTransform | undefined,
 ): void {
   const beforeArchive = purpose === "before-archive";
   // Import preserves aliases until canonical repair; standalone validation compares canonical keys.
@@ -308,6 +342,7 @@ function validateLegacySessionRecord(
               path: record.transcriptPath,
               sessionId: record.entry.sessionId,
               originalPath: record.historical?.originalPath,
+              doctorCompactionTranscriptTransform,
             },
           ],
           env,

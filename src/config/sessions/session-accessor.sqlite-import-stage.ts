@@ -23,6 +23,12 @@ import {
 
 type StagedTranscriptRow = { seq: number; eventJson: string };
 
+export type DoctorCompactionTranscriptTransform = (
+  database: DatabaseSync,
+  sessionId: string,
+  eventJson: string,
+) => string;
+
 export function withSqliteSessionImportStage<T>(run: (stage: SqliteSessionImportStage) => T): T {
   const directory = createPrivateSqliteTempDirectorySync(os.tmpdir(), "openclaw-session-import-");
   let database: DatabaseSync | undefined;
@@ -76,8 +82,19 @@ export class SqliteSessionImportStage {
     this.insertSeen = database.prepare("INSERT INTO seen VALUES (?, ?)");
   }
 
-  append(source: number, seq: number, eventJson: string): void {
-    this.insert.run(source, seq, eventJson);
+  append(
+    source: number,
+    seq: number,
+    eventJson: string,
+    doctorCompaction?: { sessionId: string; transform: DoctorCompactionTranscriptTransform },
+  ): void {
+    this.insert.run(
+      source,
+      seq,
+      doctorCompaction
+        ? doctorCompaction.transform(this.database, doctorCompaction.sessionId, eventJson)
+        : eventJson,
+    );
   }
 
   rows(source: number): Iterable<StagedTranscriptRow> {
@@ -91,14 +108,27 @@ export class SqliteSessionImportStage {
   }
 
   *iterateUnseenEvents(source: number): Generator<TranscriptEvent, void, boolean> {
+    const rows = this.iterateUnseenRows(source);
+    try {
+      let next = rows.next();
+      while (!next.done) {
+        // SAFETY: staging serialized the caller's TranscriptEvent or retained its validated JSON.
+        const inserted = yield JSON.parse(next.value.eventJson) as TranscriptEvent;
+        next = rows.next(inserted);
+      }
+    } finally {
+      rows.return();
+    }
+  }
+
+  *iterateUnseenRows(source: number): Generator<StagedTranscriptRow, void, boolean> {
     for (const row of this.rows(source)) {
       const eventHash = hash("sha256", row.eventJson, "buffer");
       // Hash narrows the lookup; exact bytes decide equality even under a hash collision.
       if (this.findSeen.get(eventHash, row.eventJson) !== undefined) {
         continue;
       }
-      // SAFETY: staging serialized the caller's TranscriptEvent without transforming its contents.
-      const inserted = yield JSON.parse(row.eventJson) as TranscriptEvent;
+      const inserted = yield row;
       // Rejected identities stay unseen so later attempts retain their window recency writes.
       if (inserted) {
         this.insertSeen.run(eventHash, row.eventJson);

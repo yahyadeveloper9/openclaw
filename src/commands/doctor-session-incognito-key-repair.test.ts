@@ -51,7 +51,7 @@ describe("doctor reserved incognito session key repair", () => {
         spawnedBy: oldKey,
         completionOwnerSessionKey: oldKey,
         forkSource: { sessionKey: oldKey, sessionId: "source" },
-        compactionCheckpoints: [{ checkpointId: "checkpoint", sessionKey: oldKey }],
+        retainedHistoryReferences: { sessionIds: ["session-old", "source"], artifactPaths: [] },
         systemPromptReport: { source: "run", generatedAt: 1, sessionKey: oldKey },
         pluginExtensions: { test: { label: oldKey } },
       });
@@ -237,7 +237,7 @@ describe("doctor reserved incognito session key repair", () => {
         parentSessionKey: newKey,
         completionOwnerSessionKey: newKey,
         forkSource: { sessionKey: newKey },
-        compactionCheckpoints: [{ sessionKey: newKey }],
+        retainedHistoryReferences: { sessionIds: ["session-old", "source"], artifactPaths: [] },
         systemPromptReport: { sessionKey: newKey },
         skillsSnapshot,
         pluginExtensions: { test: { label: oldKey } },

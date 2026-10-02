@@ -1,7 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
+import { note } from "../../packages/terminal-core/src/note.js";
+import type { DoctorCompactionTranscriptTransform } from "../config/sessions/session-accessor.sqlite-import-stage.js";
 import { importSqliteSessionRowsBatch } from "../config/sessions/session-accessor.sqlite-import.js";
+import { readSessionColdTranscript } from "../config/sessions/session-cold-storage-state.js";
 import type { SessionStoreTarget as ResolvedSessionStoreTarget } from "../config/sessions/targets.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { prepareLegacyAcpMigrationSource } from "../infra/legacy-acp-migration-source.js";
@@ -21,6 +24,7 @@ import {
   type ActiveSessionSqliteMigrationRun,
 } from "../infra/session-sqlite-migration-manifest.js";
 import {
+  assertTranscriptFileUnchanged,
   countTranscriptEventsForPath,
   createTranscriptEventReader,
   readOnlySqliteValidationSnapshot,
@@ -29,9 +33,22 @@ import {
   type ReadOnlySqliteValidationSnapshot,
 } from "../infra/session-sqlite-migration-readers.js";
 import { verifyCanonicalSessionTranscriptSources } from "../infra/session-sqlite-transcript-verification.js";
+import {
+  assertExistingDatabaseIdentity,
+  readDatabasePathIdentitySync,
+} from "../infra/sqlite-worker-identity.js";
+import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
+import { getOpenClawDatabaseMaintenanceScope } from "../state/openclaw-state-db-async-lifecycle.js";
+import { backupDoctorSqliteDatabases } from "./doctor-migration-backup.js";
+import {
+  applyLegacyCompactionEventFacts,
+  createLegacyCompactionTranscriptTransform,
+  prepareLegacySessionCompactionHistory,
+} from "./doctor-session-compaction-history.js";
 import type { LegacySessionRecord } from "./doctor-session-sqlite-discovery.js";
 import type { collectRecoveryInventory } from "./doctor-session-sqlite-recovery-inventory.js";
 import type { DoctorSessionSqliteTargetReport } from "./doctor-session-sqlite-types.js";
+import type { DoctorSqliteMaintenanceAuthority } from "./doctor-sqlite-maintenance-lock.js";
 import { normalizePersistedSessionEntryShape } from "./doctor/shared/session-entry-shape.js";
 
 type SessionStoreTarget = ResolvedSessionStoreTarget & { sqlitePath?: string };
@@ -43,11 +60,13 @@ export async function importLegacySessionRecords(
     env,
     expectedIndexIdentity,
     recoveryInventory,
+    authority,
   }: {
     target: SessionStoreTarget;
     env: NodeJS.ProcessEnv;
     expectedIndexIdentity?: MigrationArtifactIdentity;
     recoveryInventory?: ReturnType<typeof collectRecoveryInventory>;
+    authority?: DoctorSqliteMaintenanceAuthority;
   },
   records: readonly LegacySessionRecord[],
   report: DoctorSessionSqliteTargetReport,
@@ -65,8 +84,32 @@ export async function importLegacySessionRecords(
     const assertRestoredIndexCurrent = requireEmptyStore
       ? undefined
       : prepareRestoredSessionIndex({ target, env, expectedIndexIdentity, recoveryInventory });
-    // The exceptional empty-store admission and every row must share one transaction.
-    const batchSize = requireEmptyStore ? records.length : SESSION_IMPORT_BATCH_SIZE;
+    const compactionPlans = new Map(
+      records.map((record) => [record, prepareLegacySessionCompactionHistory({ ...record.entry })]),
+    );
+    const eventFacts = [...compactionPlans.values()].flatMap((plan) => plan.eventFacts);
+    const doctorCompactionTranscriptTransform =
+      eventFacts.length > 0 ? createLegacyCompactionTranscriptTransform(eventFacts) : undefined;
+    const compactionAdmission =
+      eventFacts.length > 0
+        ? await prepareCompactionImportDestination({
+            target,
+            env,
+            records,
+            sessionIds: [
+              ...new Set([
+                ...records.map((record) => record.entry.sessionId),
+                ...eventFacts.map((fact) => fact.sessionId),
+              ]),
+            ],
+            expectedIndexIdentity,
+            authority,
+          })
+        : undefined;
+    // Historical markers can follow their owning entry across batch boundaries.
+    // Keep their content and canonical metadata in the same existing spooled transaction.
+    const batchSize =
+      requireEmptyStore || eventFacts.length > 0 ? records.length : SESSION_IMPORT_BATCH_SIZE;
     const importedTranscriptSources = new Set<string>();
     const existingSnapshot = readOnlySqliteValidationSnapshot(target);
     for (let offset = 0; offset < records.length; offset += batchSize) {
@@ -78,7 +121,12 @@ export async function importLegacySessionRecords(
           importedTranscriptSources,
           existingSnapshot.ok ? existingSnapshot.snapshot : undefined,
           env,
+          compactionPlans.get(record)!,
+          doctorCompactionTranscriptTransform,
         );
+        if (!prepared && compactionPlans.get(record)!.eventFacts.length > 0) {
+          throw new Error(`Compaction history source could not be imported: ${record.sessionKey}`);
+        }
         return prepared ? [{ ...prepared, params: { ...prepared.params, env }, record }] : [];
       });
       const imported = await importSqliteSessionRowsBatch(
@@ -86,10 +134,24 @@ export async function importLegacySessionRecords(
           ...entry.params,
           requireEmptyStore,
           historicalOnly: entry.params.historicalOnly || Boolean(assertRestoredIndexCurrent),
-          ...(index === 0 && assertRestoredIndexCurrent
-            ? { beforePersistentApply: assertRestoredIndexCurrent }
+          ...(index === 0 && (assertRestoredIndexCurrent || compactionAdmission)
+            ? {
+                beforePersistentApply: () => {
+                  assertRestoredIndexCurrent?.();
+                  compactionAdmission?.assertSourcesCurrent();
+                },
+              }
             : {}),
         })),
+        eventFacts.length > 0
+          ? {
+              applyDoctorCompactionHistory: (database) => {
+                compactionAdmission?.assertDestinationCurrent();
+                applyLegacyCompactionEventFacts(database, eventFacts);
+                compactionAdmission?.assertDestinationCurrent();
+              },
+            }
+          : undefined,
       );
       for (const [index, result] of imported.entries()) {
         const record = pending[index]?.record;
@@ -126,6 +188,96 @@ export async function importLegacySessionRecords(
     }
     throw error;
   }
+}
+
+async function prepareCompactionImportDestination(params: {
+  target: SessionStoreTarget;
+  env: NodeJS.ProcessEnv;
+  records: readonly LegacySessionRecord[];
+  sessionIds: readonly string[];
+  expectedIndexIdentity?: MigrationArtifactIdentity;
+  authority?: DoctorSqliteMaintenanceAuthority;
+}) {
+  const sqlitePath = resolveTargetSqlitePath(params.target, params.env);
+  const identity = readDatabasePathIdentitySync(sqlitePath);
+  const existing = identity.key.startsWith("file:");
+  const maintenance = getOpenClawDatabaseMaintenanceScope();
+  const authority =
+    params.authority ??
+    (maintenance?.ownsSchemaMaintenance
+      ? { assertCurrent: () => maintenance.assertAdmission() }
+      : undefined);
+  if (existing && !authority) {
+    throw new Error("Compaction history import requires Doctor maintenance ownership.");
+  }
+  const assertDestinationCurrent = () => {
+    authority?.assertCurrent();
+    if (existing) {
+      assertExistingDatabaseIdentity(sqlitePath, identity.key, identity.birthtime);
+    }
+  };
+  const indexIdentity =
+    params.expectedIndexIdentity ??
+    (fs.existsSync(params.target.storePath)
+      ? readMigrationArtifactIdentity(params.target.storePath)
+      : undefined);
+  const transcriptSources = new Map(
+    params.records.flatMap((record) =>
+      record.transcriptPath && fs.existsSync(record.transcriptPath)
+        ? [[record.transcriptPath, readTranscriptFingerprint(record.transcriptPath)] as const]
+        : [],
+    ),
+  );
+  const assertSourcesCurrent = () => {
+    assertDestinationCurrent();
+    if (
+      indexIdentity &&
+      !sameMigrationArtifact(indexIdentity, readMigrationArtifactIdentity(params.target.storePath))
+    ) {
+      throw new Error(`Compaction history source changed: ${params.target.storePath}`);
+    }
+    for (const [source, fingerprint] of transcriptSources) {
+      assertTranscriptFileUnchanged(source, fingerprint);
+    }
+  };
+  assertSourcesCurrent();
+  if (existing) {
+    // Original JSONL does not preserve preexisting destination metrics or cold archives.
+    const backup = await backupDoctorSqliteDatabases({
+      env: params.env,
+      pendingDatabasePaths: [sqlitePath],
+      databasePaths: [sqlitePath],
+      authority: { assertCurrent: assertDestinationCurrent },
+    });
+    assertSourcesCurrent();
+    const backupMessages = [...backup.changes, ...backup.warnings];
+    if (backupMessages.length > 0) {
+      note(backupMessages.map((message) => `- ${message}`).join("\n"), "Session SQLite backups");
+    }
+    const cold = withOpenClawAgentDatabaseReadOnly(
+      (database) =>
+        params.sessionIds.filter((sessionId) => readSessionColdTranscript(database.db, sessionId)),
+      { agentId: params.target.agentId, path: sqlitePath, env: params.env },
+    );
+    if (!cold.found) {
+      throw new Error(
+        `Session database unavailable after compaction import backup: ${cold.reason}`,
+      );
+    }
+    if (cold.value.length > 0) {
+      const { restoreSessionColdTranscript } =
+        await import("../config/sessions/session-cold-storage.js");
+      assertSourcesCurrent();
+      for (const sessionId of cold.value) {
+        await restoreSessionColdTranscript(
+          { agentId: params.target.agentId, storePath: sqlitePath, sessionId, env: params.env },
+          assertDestinationCurrent,
+        );
+        assertSourcesCurrent();
+      }
+    }
+  }
+  return { assertSourcesCurrent, assertDestinationCurrent };
 }
 
 function prepareRestoredSessionIndex(params: {
@@ -224,6 +376,8 @@ function prepareLegacySessionImport(
   importedTranscriptSources: Set<string>,
   existingSnapshot: ReadOnlySqliteValidationSnapshot | undefined,
   env: NodeJS.ProcessEnv,
+  compactionPlan: ReturnType<typeof prepareLegacySessionCompactionHistory>,
+  doctorCompactionTranscriptTransform: DoctorCompactionTranscriptTransform | undefined,
 ) {
   if (
     record.historical &&
@@ -253,15 +407,20 @@ function prepareLegacySessionImport(
   record.sourceFingerprint = transcriptFingerprint;
   const result = countTranscriptEventsForPath(record.transcriptPath);
   const transcriptMtimeMs = readLegacyTranscriptMtimeMs(record);
-  const acpEntry = !record.historical
-    ? normalizePersistedSessionEntryShape(record.entry, { sessionKey: record.sessionKey })
-    : undefined;
+  const entry = normalizePersistedSessionEntryShape(compactionPlan.entry, {
+    sessionKey: record.sessionKey,
+  });
+  if (!entry) {
+    throw new Error(`Invalid legacy session entry: ${record.sessionKey}`);
+  }
+  const acpEntry = !record.historical ? entry : undefined;
   const params = {
     historicalOnly: Boolean(record.historical),
     allowMalformedRowRepair: true,
     repairLegacyTranscript: true,
     agentId: target.agentId,
-    entry: record.entry,
+    entry,
+    doctorCompactionTranscriptTransform,
     ...(acpEntry?.acp
       ? {
           legacyAcpMigrationSource: prepareLegacyAcpMigrationSource({
@@ -279,7 +438,10 @@ function prepareLegacySessionImport(
   };
   let recovery: LegacySessionRecord["recovery"];
   if (result.status === "missing") {
-    if (markAlreadyMigratedTranscript(record, report, existingSnapshot)) {
+    if (
+      !Object.hasOwn(record.entry, "compactionCheckpoints") &&
+      markAlreadyMigratedTranscript(record, report, existingSnapshot)
+    ) {
       return undefined;
     }
     return {
@@ -306,6 +468,7 @@ function prepareLegacySessionImport(
             path: record.transcriptPath,
             sessionId: record.entry.sessionId,
             originalPath: record.historical?.originalPath ?? record.transcriptPath,
+            doctorCompactionTranscriptTransform,
           },
         ],
         env,
@@ -357,6 +520,7 @@ function prepareLegacySessionImport(
               result.status === "malformed",
               transcriptFingerprint,
               record.historical?.originalPath ?? record.transcriptPath,
+              { preserveEventJson: doctorCompactionTranscriptTransform !== undefined },
             ),
           }
         : {}),

@@ -46,10 +46,12 @@ import {
 } from "../infra/session-sqlite-migration-readers.js";
 import { normalizeLegacySessionEntryDelivery as normalizeSessionEntryDelivery } from "../infra/state-migrations.legacy-session-store.js";
 import { migrateLegacySessionCreator } from "../state/creator-namespace-migration.js";
+import { prepareLegacySessionCompactionHistory } from "./doctor-session-compaction-history.js";
 import {
   collectRecoveryInventory,
   type RecoveryArtifactReference,
 } from "./doctor-session-sqlite-recovery-inventory.js";
+import { normalizePersistedSessionEntryShape } from "./doctor/shared/session-entry-shape.js";
 
 export type LegacySessionRecord = {
   entry: SessionEntry;
@@ -253,7 +255,14 @@ export async function discoverLegacyHistoricalTranscripts(params: {
   const owners = new Map<string, Set<string>>();
   try {
     for (const record of [...params.records, ...(params.ownershipRecords ?? [])]) {
-      for (const id of collectSessionStateIdsForEntry(record.entry)) {
+      const plan = prepareLegacySessionCompactionHistory({ ...record.entry });
+      const entry = normalizePersistedSessionEntryShape(plan.entry, {
+        sessionKey: record.sessionKey,
+      });
+      if (!entry) {
+        throw new Error(`Invalid legacy session entry: ${record.sessionKey}`);
+      }
+      for (const id of collectSessionStateIdsForEntry(entry)) {
         const keys = owners.get(id) ?? new Set<string>();
         keys.add(record.sessionKey);
         owners.set(id, keys);

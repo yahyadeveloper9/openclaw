@@ -6,12 +6,12 @@ import { sql } from "kysely";
 export const sessionReferenceProjection =
   /* kysely-allow-raw: SQLite JSON primitives extract only transcript references; raw rows retain parser semantics. */ sql<
     string | null
-  >`CASE WHEN json_valid(entry_json) THEN CASE
+  >`CASE WHEN json_valid(entry_json) AND json_type(entry_json, '$.compactionCheckpoints') IS NULL THEN CASE
     WHEN current_session_id NOT GLOB '*[^A-Za-z0-9._:@-]*'
       AND length(CAST(current_session_id AS BLOB)) = length(CAST(printf('%s', current_session_id) AS BLOB))
       AND json_type(entry_json, '$.previousSessionId') IS NULL
       AND json_type(entry_json, '$.usageFamilySessionIds') IS NULL
-      AND json_type(entry_json, '$.compactionCheckpoints') IS NULL
+      AND json_type(entry_json, '$.retainedHistoryReferences') IS NULL
       THEN '{}'
     WHEN (SELECT encoding FROM pragma_encoding) = 'UTF-8'
       AND length(CAST(entry_json AS BLOB)) = length(CAST(printf('%s', entry_json) AS BLOB))
@@ -20,16 +20,18 @@ export const sessionReferenceProjection =
       AND json_extract(entry_json, '$.sessionId') = current_session_id
       AND json_type(entry_json, '$.updatedAt') IN ('integer', 'real')
       AND json_extract(entry_json, '$.updatedAt') BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308
+      AND (json_type(entry_json, '$.retainedHistoryReferences') IS NULL
+        OR json_type(entry_json, '$.retainedHistoryReferences') = 'object')
       AND NOT EXISTS (
         SELECT 1 FROM json_each(entry_json)
-        WHERE key IN ('sessionId', 'updatedAt', 'previousSessionId', 'usageFamilySessionIds', 'compactionCheckpoints')
+        WHERE key IN ('sessionId', 'updatedAt', 'previousSessionId', 'usageFamilySessionIds', 'retainedHistoryReferences')
         GROUP BY key HAVING count(*) > 1
       )
     THEN json_object(
       'sessionId', json_extract(entry_json, '$.sessionId'),
       'previousSessionId', json_extract(entry_json, '$.previousSessionId'),
       'usageFamilySessionIds', json_extract(entry_json, '$.usageFamilySessionIds'),
-      'compactionCheckpoints', json_extract(entry_json, '$.compactionCheckpoints')
+      'retainedHistoryReferences', json_extract(entry_json, '$.retainedHistoryReferences')
     ) END END`.as("reference_json");
 
 // Validate the reference shapes before flattening them. Bad optional values must
@@ -41,21 +43,29 @@ export const usableSessionReferenceProjection =
     WHEN reference_json IS NOT NULL
     AND json_type(reference_json, '$.previousSessionId') IN ('text', 'null')
     AND json_type(reference_json, '$.usageFamilySessionIds') IN ('array', 'null')
-    AND json_type(reference_json, '$.compactionCheckpoints') IN ('array', 'null')
     AND NOT EXISTS (
       SELECT 1 FROM json_each(reference_json, '$.usageFamilySessionIds')
       WHERE type NOT IN ('text', 'null')
     )
-    AND NOT EXISTS (
-      SELECT 1 FROM json_each(reference_json, '$.compactionCheckpoints')
-      WHERE json_type(reference_json, '$.compactionCheckpoints') = 'array'
-        AND CASE WHEN type = 'object' THEN
-        json_type(value, '$.preCompaction') IS NOT 'object'
-        OR json_type(value, '$.postCompaction') IS NOT 'object'
-        OR coalesce(json_type(value, '$.sessionId'), 'null') NOT IN ('text', 'null')
-        OR coalesce(json_type(value, '$.preCompaction.sessionId'), 'null') NOT IN ('text', 'null')
-        OR coalesce(json_type(value, '$.postCompaction.sessionId'), 'null') NOT IN ('text', 'null')
-        ELSE 1 END
+    AND (
+      json_type(reference_json, '$.retainedHistoryReferences') = 'null'
+      OR (
+        json_type(reference_json, '$.retainedHistoryReferences.sessionIds') = 'array'
+        AND json_type(reference_json, '$.retainedHistoryReferences.artifactPaths') = 'array'
+        AND json_array_length(reference_json, '$.retainedHistoryReferences.artifactPaths') = 0
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(reference_json, '$.retainedHistoryReferences')
+          WHERE key NOT IN ('sessionIds', 'artifactPaths')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(reference_json, '$.retainedHistoryReferences.sessionIds')
+          WHERE type != 'text' OR value = '' OR value GLOB '*[^A-Za-z0-9._:@-]*'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(reference_json, '$.retainedHistoryReferences.sessionIds')
+          GROUP BY value HAVING count(*) > 1
+        )
+      )
     )
     AND NOT EXISTS (
       SELECT 1 FROM json_tree(reference_json)
@@ -64,7 +74,7 @@ export const usableSessionReferenceProjection =
     THEN reference_json END`.as("references");
 
 export const sessionReferenceAtoms =
-  /* kysely-allow-raw: emit only known reference paths, excluding checkpoint metadata and nested unrelated fields. */ sql<{
+  /* kysely-allow-raw: emit only canonical reference paths, excluding artifact paths and unrelated fields. */ sql<{
     atom: string | null;
     fullkey: string;
     type: string;
@@ -73,7 +83,5 @@ export const sessionReferenceAtoms =
 export const sessionReferenceAtomPath = /* kysely-allow-raw: json_tree paths express the existing reference collector without decoding entry objects in JS. */ sql<boolean>`reference.type = 'text' AND (
     reference.fullkey IN ('$.sessionId', '$.previousSessionId')
     OR reference.fullkey GLOB '$.usageFamilySessionIds[[]*[]]'
-    OR reference.fullkey GLOB '$.compactionCheckpoints[[]*[]].sessionId'
-    OR reference.fullkey GLOB '$.compactionCheckpoints[[]*[]].preCompaction.sessionId'
-    OR reference.fullkey GLOB '$.compactionCheckpoints[[]*[]].postCompaction.sessionId'
+    OR reference.fullkey GLOB '$.retainedHistoryReferences.sessionIds[[]*[]]'
   )`;

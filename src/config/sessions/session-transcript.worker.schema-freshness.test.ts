@@ -13,7 +13,10 @@ import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { captureOpenClawStateReadWorkerContext } from "../../state/openclaw-state-worker-context.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { replaceSessionEntrySync } from "./session-accessor.js";
-import { appendTranscriptMessageSync } from "./session-accessor.sqlite-transcript-write.js";
+import {
+  appendTranscriptEventSync,
+  appendTranscriptMessageSync,
+} from "./session-accessor.sqlite-transcript-write.js";
 import type { ChatHistoryPageParams } from "./session-history-types.js";
 import type {
   SessionTranscriptWorkerInput,
@@ -64,6 +67,17 @@ it("transfers bounded history JSON without retaining the worker buffer", async (
         },
       });
     }
+    const marker = appendTranscriptEventSync(scope, {
+      type: "compaction",
+      id: "compact",
+      parentId: "message-1",
+      firstKeptEntryId: "message-0",
+      summary: "Canonical compaction summary",
+      tokensBefore: 42_000,
+      tokensAfter: 8_000,
+      timestamp: "2026-10-01T12:00:00.000Z",
+    });
+    expect(marker.ok).toBe(true);
     await closeOpenClawAgentDatabaseByPathAsync(path);
     const stateContext = captureOpenClawStateReadWorkerContext({ env: state.env });
     const params: ChatHistoryPageParams & { sessionId: string; storePath: string } = {
@@ -104,7 +118,18 @@ it("transfers bounded history JSON without retaining the worker buffer", async (
       const body = page.encodedResponse?.messages;
       assert(body);
       expect(body.byteLength).toBeLessThanOrEqual(params.maxHistoryBytes);
-      expect(JSON.parse(new TextDecoder().decode(body))).toEqual(expected.messages);
+      const messages: unknown = JSON.parse(new TextDecoder().decode(body));
+      expect(messages).toEqual(expected.messages);
+      expect(messages).toContainEqual(
+        expect.objectContaining({
+          __openclaw: expect.objectContaining({
+            kind: "compaction",
+            id: "compact",
+            tokensBefore: 42_000,
+            tokensAfter: 8_000,
+          }),
+        }),
+      );
       const received = structuredClone(reply, { transfer: worker.transfers(reply) });
       expect(body.byteLength).toBe(0);
       expect(received).toMatchObject({

@@ -411,6 +411,8 @@ export function writeSessionEntry(
     allowStoredAliases?: boolean;
     /** Only the personal involvement owner may replace this logical-node state. */
     profileInvolvement?: SessionEntry["profileInvolvement"];
+    /** References from source rows revalidated by the replacement or rewind owner. */
+    retainedHistoryReferencesFromOwner?: SessionEntry["retainedHistoryReferences"];
     /** Only the provider review owner may replace a generation-bound pause. */
     providerReviewMutation?: boolean;
     /** Canonical row revalidated in this write transaction; null proves absence. */
@@ -443,15 +445,23 @@ export function writeSessionEntry(
       : options.allowStoredAliases && options.previousEntry !== undefined
         ? (options.previousEntry ?? undefined)
         : readExactSessionEntryRow(database, sessionKey)?.entry;
+  const sameLifecycle =
+    canonicalPreviousEntry?.sessionId === normalizedEntry.sessionId &&
+    canonicalPreviousEntry.lifecycleRevision === normalizedEntry.lifecycleRevision;
+  if (!options.allowStoredAliases) {
+    // Ordinary payloads cannot supply protection facts; commit owners carry admitted references.
+    normalizedEntry = {
+      ...normalizedEntry,
+      retainedHistoryReferences:
+        options.retainedHistoryReferencesFromOwner ??
+        (sameLifecycle ? canonicalPreviousEntry.retainedHistoryReferences : undefined),
+    };
+  }
   if (!options.providerReviewMutation && !options.allowStoredAliases) {
     // Bookkeeping can carry a stale snapshot; only the review owner may clear its pause.
     normalizedEntry = {
       ...normalizedEntry,
-      providerReview:
-        canonicalPreviousEntry?.sessionId === normalizedEntry.sessionId &&
-        canonicalPreviousEntry.lifecycleRevision === normalizedEntry.lifecycleRevision
-          ? canonicalPreviousEntry.providerReview
-          : undefined,
+      providerReview: sameLifecycle ? canonicalPreviousEntry.providerReview : undefined,
     };
   }
   if (normalizedEntry.providerReview?.sessionId !== normalizedEntry.sessionId) {

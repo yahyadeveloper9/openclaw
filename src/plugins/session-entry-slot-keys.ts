@@ -16,6 +16,7 @@ const SESSION_ENTRY_RESERVED_SLOT_KEY_LIST = [
   "sessionId",
   "lifecycleRevision",
   "providerReview",
+  "retainedHistoryReferences",
   "updatedAt",
   "incognito",
   "archivedAt",

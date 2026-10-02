@@ -307,10 +307,6 @@ vi.mock("../gateway/server-methods/chat-history-budget.js", async (importOrigina
   replaceOversizedChatHistoryMessages: ({ messages }: { messages: unknown[] }) => ({ messages }),
 }));
 
-vi.mock("../gateway/server-methods/chat-history-page-kernel.js", () => ({
-  enrichChatHistoryCompactionMarkers: (messages: unknown[]) => messages,
-}));
-
 vi.mock("../gateway/server-methods/chat-history-pages.js", () => ({
   readChatHistoryPage: (params: unknown) => readChatHistoryPageMock(params),
 }));
@@ -1385,16 +1381,30 @@ describe("EmbeddedTuiBackend", () => {
   });
 
   it("uses the canonical gateway projector for embedded TUI history reads", async () => {
+    const entry = {
+      sessionId: "sess-main",
+      retainedHistoryReferences: { sessionIds: ["sess-main"], artifactPaths: [] },
+    };
     loadSessionEntryMock.mockReturnValue({
       cfg: {},
       agentId: "main",
       canonicalKey: "agent:main:main",
       storePath: "/tmp/openclaw-sessions.json",
-      entry: { sessionId: "sess-main" },
+      entry,
     });
 
     const backend = new EmbeddedTuiBackend();
     const messages = [
+      {
+        role: "system",
+        content: [{ type: "text", text: "Compaction" }],
+        __openclaw: {
+          kind: "compaction",
+          id: "compact",
+          tokensBefore: 100,
+          tokensAfter: 25,
+        },
+      },
       {
         role: "toolResult",
         toolCallId: "wait",
@@ -1415,7 +1425,7 @@ describe("EmbeddedTuiBackend", () => {
     });
 
     expect(readChatHistoryPageMock).toHaveBeenCalledWith({
-      entry: { sessionId: "sess-main" },
+      entry,
       provider: "openai",
       sessionId: "sess-main",
       storePath: "/tmp/openclaw-sessions.json",

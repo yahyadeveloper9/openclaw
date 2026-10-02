@@ -7,6 +7,7 @@ import {
   closeOpenClawAgentDatabasesAsync,
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
+  runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
 import {
@@ -15,7 +16,9 @@ import {
   patchSessionEntryCore,
   upsertSessionEntryCore,
 } from "./session-accessor.js";
+import { writeSessionEntry } from "./session-accessor.sqlite-entry-store.js";
 import { replaceSessionEntrySync } from "./session-accessor.sqlite-entry.js";
+import { applySessionEntryCanonicalReplacements } from "./session-accessor.sqlite-replacement-projection.js";
 import {
   projectPublicSessionEntry,
   projectPublicSessionEntryPatch,
@@ -38,6 +41,149 @@ afterEach(async () => {
 });
 
 describe("SQLite session row persistence", () => {
+  it("keeps migrated history references private through replacements and patches", async () => {
+    const scope = createScope("retained-history");
+    const retainedHistoryReferences = {
+      sessionIds: ["retained-generation"],
+      artifactPaths: ["/synthetic/retained-history.jsonl"],
+    };
+    const entry: InternalSessionEntry = {
+      sessionId: "current-generation",
+      lifecycleRevision: "current-lifecycle",
+      updatedAt: Date.now(),
+      retainedHistoryReferences,
+    };
+    runOpenClawAgentWriteTransaction(
+      (database) =>
+        writeSessionEntry(database, scope.sessionKey, entry, { allowStoredAliases: true }),
+      scope,
+    );
+    expect(loadSessionEntry(scope)?.retainedHistoryReferences).toEqual(retainedHistoryReferences);
+    const publicEntry = projectPublicSessionEntry(entry);
+    expect(publicEntry).not.toHaveProperty("retainedHistoryReferences");
+    expect(projectPublicSessionEntryPatch(entry)).not.toHaveProperty("retainedHistoryReferences");
+
+    await patchSessionEntryCore(scope, () => publicEntry, {
+      replaceEntry: true,
+      skipMaintenance: true,
+    });
+    expect(loadSessionEntry(scope)?.retainedHistoryReferences).toEqual(retainedHistoryReferences);
+    for (const candidate of [
+      undefined,
+      { sessionIds: ["unowned-generation"], artifactPaths: [] },
+    ]) {
+      await patchSessionEntryCore(scope, () => ({ retainedHistoryReferences: candidate }), {
+        skipMaintenance: true,
+      });
+      expect(loadSessionEntry(scope)?.retainedHistoryReferences).toEqual(retainedHistoryReferences);
+    }
+
+    const forkScope = { ...scope, sessionKey: "agent:main:retained-history-fork" };
+    const forkEntry = { ...entry, sessionId: "fork-generation" };
+    await patchSessionEntryCore(forkScope, () => forkEntry, {
+      fallbackEntry: forkEntry,
+      replaceEntry: true,
+      skipMaintenance: true,
+    });
+    expect(loadSessionEntry(forkScope)?.retainedHistoryReferences).toBeUndefined();
+    expect(loadSessionEntry(scope)?.retainedHistoryReferences).toEqual(retainedHistoryReferences);
+  });
+
+  it.each(["sessionId", "lifecycleRevision"] as const)(
+    "releases migrated history references when %s changes",
+    async (changedField) => {
+      const scope = createScope(`retained-history-${changedField}`);
+      const entry: InternalSessionEntry = {
+        sessionId: "current-generation",
+        lifecycleRevision: "current-lifecycle",
+        updatedAt: Date.now(),
+        retainedHistoryReferences: {
+          sessionIds: ["retained-generation"],
+          artifactPaths: ["/synthetic/retained-history.jsonl"],
+        },
+      };
+      runOpenClawAgentWriteTransaction(
+        (database) =>
+          writeSessionEntry(database, scope.sessionKey, entry, { allowStoredAliases: true }),
+        scope,
+      );
+      await patchSessionEntryCore(scope, () => ({ ...entry, [changedField]: "successor" }), {
+        replaceEntry: true,
+        skipMaintenance: true,
+      });
+      expect(loadSessionEntry(scope)).toMatchObject({ [changedField]: "successor" });
+      expect(loadSessionEntry(scope)?.retainedHistoryReferences).toBeUndefined();
+    },
+  );
+
+  it.each([false, true])(
+    "transfers only same-lifecycle references from revalidated aliases (reset: %s)",
+    async (reset) => {
+      const scope = createScope(`retained-history-alias-${reset}`);
+      const aliases = [scope.sessionKey, `${scope.sessionKey}-other`];
+      const targetKey = `${scope.sessionKey}-canonical`;
+      const entry = {
+        sessionId: "alias-generation",
+        lifecycleRevision: "alias-lifecycle",
+        updatedAt: Date.now(),
+      };
+      const database = openOpenClawAgentDatabase(scope);
+      runOpenClawAgentWriteTransaction((owner) => {
+        writeSessionEntry(
+          owner,
+          targetKey,
+          {
+            ...entry,
+            retainedHistoryReferences: { sessionIds: ["target-history"], artifactPaths: [] },
+          },
+          { allowStoredAliases: true },
+        );
+        for (const [index, sessionKey] of aliases.entries()) {
+          writeSessionEntry(
+            owner,
+            sessionKey,
+            {
+              ...entry,
+              retainedHistoryReferences: { sessionIds: [`history-${index}`], artifactPaths: [] },
+            },
+            { allowStoredAliases: true },
+          );
+        }
+      }, scope);
+
+      await applySessionEntryCanonicalReplacements({
+        agentId: scope.agentId,
+        env: scope.env,
+        storePath: database.path,
+        sessionKeys: [targetKey, ...aliases],
+        skipMaintenance: true,
+        update: () => ({
+          result: undefined,
+          replacements: [
+            {
+              sessionKey: targetKey,
+              previousSessionKeys: aliases,
+              entry: {
+                ...entry,
+                lifecycleRevision: reset ? "reset-lifecycle" : entry.lifecycleRevision,
+              },
+            },
+          ],
+        }),
+      });
+      expect(
+        loadSessionEntry({ ...scope, sessionKey: targetKey })?.retainedHistoryReferences,
+      ).toEqual(
+        reset
+          ? undefined
+          : { sessionIds: ["target-history", "history-0", "history-1"], artifactPaths: [] },
+      );
+      for (const sessionKey of aliases) {
+        expect(loadSessionEntry({ ...scope, sessionKey })).toBeUndefined();
+      }
+    },
+  );
+
   it("bounds saved-prompt decoding while publishing identity changes", async () => {
     const env = {
       ...process.env,

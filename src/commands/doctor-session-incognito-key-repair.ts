@@ -326,13 +326,6 @@ function visitSessionEntryKeyFields(
   if (isRecord(value.forkSource)) {
     visit(value.forkSource, "sessionKey");
   }
-  if (Array.isArray(value.compactionCheckpoints)) {
-    for (const checkpoint of value.compactionCheckpoints) {
-      if (isRecord(checkpoint)) {
-        visit(checkpoint, "sessionKey");
-      }
-    }
-  }
   if (isRecord(value.systemPromptReport)) {
     visit(value.systemPromptReport, "sessionKey");
   }

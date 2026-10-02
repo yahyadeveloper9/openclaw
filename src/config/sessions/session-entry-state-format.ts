@@ -39,6 +39,7 @@ export const LEGACY_SESSION_ENTRY_STATE_FIELDS = [
 /** Detection grants no read-through compatibility; Doctor owns the conversion. */
 export function hasLegacySessionEntryState(value: object): boolean {
   return (
+    Object.hasOwn(value, "compactionCheckpoints") ||
     ("pendingFinalDelivery" in value && typeof value.pendingFinalDelivery === "boolean") ||
     hasLegacySessionProviderState(value) ||
     LEGACY_SESSION_ENTRY_STATE_FIELDS.some((field) => Object.hasOwn(value, field))

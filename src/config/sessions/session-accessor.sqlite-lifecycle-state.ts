@@ -145,6 +145,7 @@ export function readReferencedSessionIds(
           ELSE json_type(entry_json, '$.previousSessionId') IS NOT NULL
             OR json_type(entry_json, '$.usageFamilySessionIds') IS NOT NULL
             OR json_type(entry_json, '$.compactionCheckpoints') IS NOT NULL
+            OR json_type(entry_json, '$.retainedHistoryReferences') IS NOT NULL
         END`,
       ]),
     );
@@ -192,7 +193,7 @@ export function readReferencedSessionIds(
     } else if (
       row.atom !== null &&
       row.fullkey !== null &&
-      /^\$\.(sessionId|previousSessionId|usageFamilySessionIds\[\d+\]|compactionCheckpoints\[\d+\]\.(sessionId|(?:preCompaction|postCompaction)\.sessionId))$/u.test(
+      /^\$\.(sessionId|previousSessionId|usageFamilySessionIds\[\d+\]|retainedHistoryReferences\.sessionIds\[\d+\])$/u.test(
         row.fullkey,
       )
     ) {

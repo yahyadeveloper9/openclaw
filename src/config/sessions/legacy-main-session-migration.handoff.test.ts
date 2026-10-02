@@ -18,6 +18,7 @@ import {
   seedClaim,
   setupLegacyMainSessionMigrationTests,
 } from "./legacy-main-session-migration.test-support.js";
+import { resolveSessionArtifactDirectory } from "./paths.js";
 import { deleteSessionEntryLifecycle } from "./session-accessor.js";
 import { readExactSessionEntryRowForCanonicalRepair } from "./session-accessor.sqlite-canonical-repair.js";
 import { readSessionTranscriptHistoryAnchorPage } from "./session-accessor.sqlite-history.test-support.js";
@@ -389,7 +390,7 @@ describe("legacy main session history handoff", () => {
     expect(committed).toEqual([]);
   });
 
-  it.each(["existing-current", "cold"] as const)(
+  it.each(["existing-current", "cold", "cold-custody-refusal"] as const)(
     "preserves every retained generation through a %s cross-store handoff",
     async (kind) => {
       const fixture = createFixture();
@@ -397,11 +398,18 @@ describe("legacy main session history handoff", () => {
       const destinationPath = databasePath(fixture.stateDir, "ops");
       const sourceKey = "agent:main:chat";
       const canonicalKey = "agent:ops:chat";
+      const protectedArtifact = path.join(
+        resolveSessionArtifactDirectory(sourcePath),
+        "current.checkpoint.00000000-0000-4000-8000-000000000000.jsonl",
+      );
       const ids = ["retained-first", "retained-previous", "current"];
       const entries = ids.map((sessionId, index) => ({
         sessionId,
         updatedAt: index + 1,
         ...(index > 0 ? { previousSessionId: ids[index - 1] } : {}),
+        ...(kind === "cold-custody-refusal"
+          ? { retainedHistoryReferences: { sessionIds: [], artifactPaths: [protectedArtifact] } }
+          : {}),
       }));
       const events = ids.map((sessionId, index) => [
         {
@@ -438,7 +446,7 @@ describe("legacy main session history handoff", () => {
           }),
           { agentId, path: pathname, env: fixture.env },
         );
-      if (kind === "cold") {
+      if (kind !== "existing-current") {
         runOpenClawAgentWriteTransaction(
           ({ db }) => {
             db.prepare(
@@ -451,7 +459,7 @@ describe("legacy main session history handoff", () => {
       const before = snapshot("main", sourcePath);
       expect(before.windows).toHaveLength(3);
       expect(before.events).toHaveLength(6);
-      if (kind === "existing-current") {
+      if (kind !== "cold") {
         seedClaim({
           databaseAgentId: "ops",
           databasePath: destinationPath,
@@ -460,9 +468,8 @@ describe("legacy main session history handoff", () => {
           events: events[2],
         });
       }
-      const existingBefore =
-        kind === "existing-current" ? snapshot("ops", destinationPath) : undefined;
-      if (kind === "cold") {
+      const existingBefore = kind !== "cold" ? snapshot("ops", destinationPath) : undefined;
+      if (kind !== "existing-current") {
         const archived = await runSessionColdStorageMaintenance({
           config: {
             agents: { entries: { main: {} } },
@@ -473,6 +480,48 @@ describe("legacy main session history handoff", () => {
           },
         });
         expect(archived.archivedTranscripts).toBeGreaterThan(0);
+      }
+
+      if (kind === "cold-custody-refusal") {
+        fs.mkdirSync(path.dirname(protectedArtifact), { recursive: true });
+        fs.writeFileSync(protectedArtifact, "Protected artifact: café 🦞\n");
+        const sourceOptions = { agentId: "main", path: sourcePath, env: fixture.env };
+        const cold = runOpenClawAgentWriteTransaction(
+          ({ db }) => readSessionColdTranscript(db, "current"),
+          sourceOptions,
+        );
+        expect(cold?.storage).toBe("file");
+        if (!cold) {
+          throw new Error("Expected cold source history before the custody refusal");
+        }
+        const archive = { ...cold, archive_blob: null };
+        const archiveBytes = await readVerifiedSessionColdArchive({
+          storePath: sourcePath,
+          archive,
+        });
+        expect(snapshot("main", sourcePath).events).not.toEqual(before.events);
+
+        await expect(repair(fixture)).rejects.toThrow("Protected history artifact");
+
+        expect(
+          readClaim({ databaseAgentId: "main", databasePath: sourcePath, key: sourceKey })?.entry,
+        ).toMatchObject(entries[2]!);
+        const restored = snapshot("main", sourcePath);
+        expect(restored.events).toEqual(before.events);
+        expect(restored.identities).toEqual(before.identities);
+        expect(restored.windows.every((window) => window.session_key === sourceKey)).toBe(true);
+        expect(
+          runOpenClawAgentWriteTransaction(
+            ({ db }) => readSessionColdTranscript(db, "current"),
+            sourceOptions,
+          ),
+        ).toBeUndefined();
+        await expect(
+          readVerifiedSessionColdArchive({ storePath: sourcePath, archive }),
+        ).resolves.toEqual(archiveBytes);
+        expect(fs.readFileSync(protectedArtifact, "utf8")).toBe("Protected artifact: café 🦞\n");
+        expect(snapshot("ops", destinationPath)).toEqual(existingBefore);
+        return;
       }
 
       const result = await repair(fixture);

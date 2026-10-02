@@ -1,9 +1,12 @@
+import { SessionStoreMigrationRequiredError } from "../config/sessions/migration-required.js";
+import { resolveSessionArtifactDirectory } from "../config/sessions/paths.js";
 import {
   applySessionEntryLifecycleMutation,
   copySessionOwnedStateForCanonicalRepair,
   ensureTranscriptGenerationsForCanonicalRepair,
   listSessionGenerationIdsForCanonicalRepair,
   loadCanonicalSessionRepairEntries,
+  loadExactSessionEntryReadOnly,
   loadTranscriptEvents,
   rehomeSessionDeliveryReferencesForCanonicalRepair,
   rehomeSessionDeliveryReferencesForCanonicalRepairBatch,
@@ -11,18 +14,32 @@ import {
 } from "../config/sessions/session-accessor.js";
 import { writeTranscriptArchive } from "../config/sessions/session-accessor.sqlite-archive-artifact.js";
 import {
+  readSqliteSessionGenerationClaim,
+  readSqliteSessionGenerationWindows,
+} from "../config/sessions/session-accessor.sqlite-generation-copy.js";
+import type { SqliteSessionGenerationClaim } from "../config/sessions/session-accessor.sqlite-generation.types.js";
+import {
   copySessionNodeArtifactsForRepair,
   deleteSessionMembersForRepair,
 } from "../config/sessions/session-accessor.sqlite-node-artifacts.js";
 import { replaceSessionOwnerInTransaction } from "../config/sessions/session-accessor.sqlite-owner.js";
 import { collectSessionStateIdsForEntry } from "../config/sessions/session-accessor.sqlite-references.js";
-import { resolveSqliteTranscriptArchiveDirectory } from "../config/sessions/session-accessor.sqlite-scope.js";
+import {
+  getSessionKysely,
+  resolveSqliteTranscriptArchiveDirectory,
+} from "../config/sessions/session-accessor.sqlite-scope.js";
 import { setCanonicalSqliteSessionMainKey } from "../config/sessions/session-canonical-key.js";
 import { preserveCreationStamp } from "../config/sessions/session-entry-provenance.js";
+import {
+  assertRetainedHistoryArtifactTransfer,
+  mergeRetainedHistoryReferences,
+} from "../config/sessions/session-retained-history.js";
 import { serializeJsonlLines } from "../config/sessions/transcript-jsonl.js";
-import type { SessionEntry } from "../config/sessions/types.js";
+import type { InternalSessionEntry as SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { iterateSqliteQuerySync, sqliteStringSet } from "../infra/kysely-sync.js";
 import { resolveTargetSqliteOptions } from "../infra/session-sqlite-migration-readers.js";
+import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
 import {
   openOpenClawAgentDatabase,
   type OpenClawAgentDatabase,
@@ -214,11 +231,144 @@ function selectCanonicalSessionCandidate(
   const authoritativeStamp =
     requiredCandidates.find(({ preferred }) => preferred)?.entry ??
     mergeCanonicalSessionEntryCandidates(requiredCandidates)?.entry;
+  const entry = preserveCreationStamp(selected.entry, authoritativeStamp);
+  if (candidates.every((candidate) => candidate.sqlitePath === destination.sqlitePath)) {
+    entry.retainedHistoryReferences = mergeRetainedHistoryReferences(
+      candidates.map((candidate) => candidate.entry.retainedHistoryReferences),
+    );
+  }
   return {
     ...selected,
-    entry: preserveCreationStamp(selected.entry, authoritativeStamp),
+    entry,
     destination,
   };
+}
+
+function assertCanonicalHistoryCustody(
+  candidates: readonly CanonicalSessionCandidate[],
+  selected: NonNullable<ReturnType<typeof selectCanonicalSessionCandidate>>,
+  env: NodeJS.ProcessEnv,
+  destinationCommitted = false,
+): void {
+  const { winner, destination } = selected;
+  if (candidates.every((candidate) => candidate.sqlitePath === destination.sqlitePath)) {
+    return;
+  }
+  for (const candidate of candidates) {
+    if (candidate.sqlitePath !== destination.sqlitePath) {
+      assertRetainedHistoryArtifactTransfer(
+        candidate.entry.retainedHistoryReferences,
+        resolveSessionArtifactDirectory(candidate.storePath),
+        resolveSessionArtifactDirectory(destination.storePath),
+      );
+    }
+  }
+  const references = mergeRetainedHistoryReferences(
+    candidates.map((candidate) => candidate.entry.retainedHistoryReferences),
+  );
+  if (
+    destinationCommitted &&
+    references &&
+    (references.sessionIds.length > 0 || references.artifactPaths.length > 0)
+  ) {
+    const committed = loadExactSessionEntryReadOnly({
+      agentId: destination.agentId,
+      env,
+      sessionKey: winner.canonicalKey,
+      storePath: destination.storePath,
+    })?.entry;
+    if (
+      committed?.sessionId !== selected.entry.sessionId ||
+      committed.lifecycleRevision !== selected.entry.lifecycleRevision ||
+      references.sessionIds.some(
+        (id) => !committed.retainedHistoryReferences?.sessionIds.includes(id),
+      ) ||
+      references.artifactPaths.some(
+        (artifact) => !committed.retainedHistoryReferences?.artifactPaths.includes(artifact),
+      )
+    ) {
+      throw new SessionStoreMigrationRequiredError(
+        `The destination owner for ${winner.canonicalKey} no longer protects its migrated history. Preserve the source owners and rerun Doctor after resolving the concurrent session change.`,
+      );
+    }
+  }
+  const ids = references?.sessionIds ?? [];
+  if (ids.length === 0) {
+    selected.entry.retainedHistoryReferences = references;
+    return;
+  }
+  const stores = new Map<string, Map<string, SqliteSessionGenerationClaim | null>>();
+  const inspect = (store: { agentId: string; storePath: string; sqlitePath: string }) => {
+    const cached = stores.get(store.sqlitePath);
+    if (cached) {
+      return cached;
+    }
+    const result = withOpenClawAgentDatabaseReadOnly(
+      (database) => {
+        const claims = new Map<string, SqliteSessionGenerationClaim | null>(
+          readSqliteSessionGenerationWindows(database, [], ids).map((window) => [
+            window.session_id,
+            readSqliteSessionGenerationClaim(database, window),
+          ]),
+        );
+        for (const row of iterateSqliteQuerySync(
+          database.db,
+          getSessionKysely(database.db)
+            .selectFrom("transcript_events")
+            .select("session_id")
+            .where("session_id", "in", sqliteStringSet(ids))
+            .groupBy("session_id"),
+        )) {
+          if (!claims.has(row.session_id)) {
+            claims.set(row.session_id, null);
+          }
+        }
+        return claims;
+      },
+      resolveTargetSqliteOptions(store, env),
+    );
+    if (
+      !result.found &&
+      (result.reason !== "database-missing" ||
+        candidates.some((candidate) => candidate.sqlitePath === store.sqlitePath))
+    ) {
+      throw new SessionStoreMigrationRequiredError(
+        `Cannot verify retained history in ${store.sqlitePath}: ${result.reason}; preserve the store and repair its admission before moving sessions.`,
+      );
+    }
+    const claims = result.found
+      ? result.value
+      : new Map<string, SqliteSessionGenerationClaim | null>();
+    stores.set(store.sqlitePath, claims);
+    return claims;
+  };
+  const destinationClaims = inspect(destination);
+  const winnerClaims = inspect(winner);
+  const copiedIds = new Set([
+    ...collectSessionStateIdsForEntry(winner.entry),
+    ...[...winnerClaims.values()].flatMap((claim) =>
+      claim?.window.session_key === winner.sessionKey ? [claim.window.session_id] : [],
+    ),
+  ]);
+  for (const candidate of candidates) {
+    const sourceClaims = inspect(candidate);
+    for (const id of candidate.entry.retainedHistoryReferences?.sessionIds ?? []) {
+      if (!sourceClaims.has(id)) {
+        continue;
+      }
+      const source = sourceClaims.get(id);
+      const retained =
+        !destinationCommitted && winner.sqlitePath !== destination.sqlitePath && copiedIds.has(id)
+          ? winnerClaims.get(id)
+          : destinationClaims.get(id);
+      if (!source || !retained || source.contentFingerprint !== retained.contentFingerprint) {
+        throw new SessionStoreMigrationRequiredError(
+          `Protected transcript ${id} in ${candidate.sqlitePath} would not retain its exact content when moving ${candidate.sessionKey} to ${destination.sqlitePath}. Preserve both stores and reconcile this history before retrying Doctor; the original owners remain required.`,
+        );
+      }
+    }
+  }
+  selected.entry.retainedHistoryReferences = references;
 }
 
 type SingleDatabaseCanonicalRepairGroup = {
@@ -369,6 +519,7 @@ async function repairCanonicalSessionGroup(
   if (!selected) {
     return [];
   }
+  assertCanonicalHistoryCustody(candidates, selected, params.env);
   await ensureTranscriptGenerationsForCanonicalRepair(candidates);
   const winner = selected.winner;
   const destination = selected.destination;
@@ -435,6 +586,7 @@ async function repairCanonicalSessionGroup(
       }
     }
   }
+  assertCanonicalHistoryCustody(candidates, selected, params.env);
   setCanonicalSqliteSessionMainKey(
     openOpenClawAgentDatabase(resolveTargetSqliteOptions(destination, params.env)),
     params.cfg.session?.mainKey,
@@ -442,6 +594,8 @@ async function repairCanonicalSessionGroup(
   const winnerResult = await applySessionEntryLifecycleMutation({
     agentId: destination.agentId,
     allowCanonicalRepair: true,
+    beforeCommitInTransaction: () =>
+      assertCanonicalHistoryCustody(candidates, selected, params.env),
     afterUpsertsInTransaction: (destinationDatabase) => {
       applyCanonicalDestinationArtifacts({
         copyWinnerAlias: winner.sqlitePath === destination.sqlitePath,
@@ -480,6 +634,8 @@ async function repairCanonicalSessionGroup(
     const result = await applySessionEntryLifecycleMutation({
       agentId: storeCandidate.agentId,
       allowCanonicalRepair: true,
+      beforeCommitInTransaction: () =>
+        assertCanonicalHistoryCustody(candidates, selected, params.env, true),
       removals: storeCandidates.map((candidate) =>
         createCanonicalRepairRemoval(candidate, {
           archiveRemovedTranscript: true,
@@ -513,7 +669,25 @@ export async function repairCanonicalSessionKeys(params: {
   const archivedTranscriptDirectories = new Set<string>();
   let repairBatches = 0;
   let repairedGroups = 0;
+  let repairGroups = collectCanonicalSessionRepairGroups({ cfg: params.cfg, env }, stores);
   if (params.apply) {
+    for (const group of repairGroups) {
+      const first = group.candidates[0]!;
+      const destination = resolveCanonicalSessionDestination({
+        canonicalKey: first.canonicalKey,
+        cfg: params.cfg,
+        env,
+        sourceAgentId: first.agentId,
+      });
+      if (group.candidates.every((candidate) => candidate.sqlitePath === destination.sqlitePath)) {
+        continue;
+      }
+      const candidates = hydrateCanonicalSessionCandidates(group.candidates);
+      const selected = selectCanonicalSessionCandidate(candidates, { cfg: params.cfg, env });
+      if (selected) {
+        assertCanonicalHistoryCustody(candidates, selected, env);
+      }
+    }
     for (const store of stores) {
       setCanonicalSqliteSessionMainKey(
         openOpenClawAgentDatabase(resolveTargetSqliteOptions(store, env)),
@@ -521,7 +695,6 @@ export async function repairCanonicalSessionKeys(params: {
       );
     }
   }
-  let repairGroups = collectCanonicalSessionRepairGroups({ cfg: params.cfg, env }, stores);
   const foundGroups = repairGroups.length;
   const removedRows = repairGroups.reduce((total, group) => total + group.removedRows, 0);
   if (params.apply) {

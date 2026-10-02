@@ -16,7 +16,6 @@ import type {
 } from "../../gateway/session-transcript-summary.js";
 import type { AgentHistoryActivity } from "../../infra/agent-activity-events.js";
 import type { ConversationRecord } from "./conversation-registry.types.js";
-import type { LegacyCompactionMetrics } from "./legacy-compaction-history.js";
 import type {
   SessionTranscriptDisplayDeltaResult,
   SessionTranscriptMessageByIdOptions,
@@ -69,7 +68,6 @@ export type ChatHistoryPage = {
 
 export type ChatHistoryPageParams = {
   encodeResponse?: boolean;
-  compactionMetrics?: LegacyCompactionMetrics;
   entry: InternalSessionEntry | undefined;
   provider: string | undefined;
   sessionId: string | undefined;

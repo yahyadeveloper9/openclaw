@@ -26,10 +26,17 @@ import { OpenClawAgentDatabaseMediaMigrationRequiredError } from "../state/openc
 import {
   closeOpenClawAgentDatabaseByPath,
   isOpenClawAgentDatabaseOpen,
+  type OpenClawAgentDatabase,
 } from "../state/openclaw-agent-db.js";
 import { getOpenClawDatabaseMaintenanceScope } from "../state/openclaw-state-db-async-lifecycle.js";
 import { runDoctorAgentDatabaseOperation } from "./doctor-agent-database-operation.js";
 import { backupDoctorSqliteDatabases } from "./doctor-migration-backup.js";
+import {
+  applyLegacyCompactionEventFacts,
+  createLegacyCompactionTranscriptTransform,
+  prepareLegacySessionCompactionHistory,
+  type LegacyCompactionEventFact,
+} from "./doctor-session-compaction-history.js";
 import type { DoctorSqliteMaintenanceAuthority } from "./doctor-sqlite-maintenance-lock.js";
 import {
   rewriteDoctorSessionEntries,
@@ -87,6 +94,7 @@ type PreparedSessionEntryRepairParams =
         entry: Record<string, unknown>,
         sessionKey: string,
         updatedAt: number,
+        database: OpenClawAgentDatabase,
       ) => Record<string, unknown>;
       deferSchemaRepair?: boolean;
     });
@@ -205,18 +213,36 @@ export async function repairLegacySessionEntryStates(params: {
   deferSchemaRepair?: boolean;
 }): Promise<SessionDeliveryStateRepairReport> {
   try {
+    const preparedFacts = new Map<string, Map<string, string>>();
+    const preparedTransforms = new Map<
+      string,
+      ReturnType<typeof createLegacyCompactionTranscriptTransform>
+    >();
     const plan = prepareSessionEntryRepairs({
       ...params,
       source: "raw",
       rawNeedsRepair: hasLegacySessionEntryState,
-      rawTransform: (entry, _sessionKey, updatedAt) => {
+      rawTransform: (entry, sessionKey, updatedAt, database) => {
         if (!hasLegacySessionEntryState(entry)) {
           return entry;
         }
         const next = migrateLegacySessionEntryState(entry, updatedAt);
-        return hasLegacySessionProviderState(entry)
-          ? normalizeLegacySessionEntryDelivery(next)
-          : next;
+        const prepared = prepareLegacySessionCompactionHistory(
+          hasLegacySessionProviderState(entry) ? normalizeLegacySessionEntryDelivery(next) : next,
+        );
+        const fingerprint = JSON.stringify([
+          prepared.entry.retainedHistoryReferences,
+          prepared.eventFacts,
+        ]);
+        if (preparedFacts.get(database.path)?.get(sessionKey) !== fingerprint) {
+          throw new Error(`Compaction history changed after backup preparation for ${sessionKey}`);
+        }
+        applyLegacyCompactionEventFacts(
+          database,
+          prepared.eventFacts,
+          preparedTransforms.get(database.path),
+        );
+        return prepared.entry;
       },
       updateDeliveryProjection: true,
     });
@@ -252,7 +278,50 @@ export async function repairLegacySessionEntryStates(params: {
       authority: { assertCurrent },
     });
     assertCurrent();
-    note(backup.changes.map((change) => `- ${change}`).join("\n"), "Session SQLite backups");
+    note(
+      [...backup.changes, ...backup.warnings].map((message) => `- ${message}`).join("\n"),
+      "Session SQLite backups",
+    );
+    for (const { target, scope, sessionKeys, identity } of plan.pending) {
+      assertTargetCurrent(target);
+      const selected = new Set(sessionKeys);
+      const transcriptIds = new Set<string>();
+      const eventFacts: LegacyCompactionEventFact[] = [];
+      const fingerprints = new Map<string, string>();
+      scanDoctorSessionEntryRecords(
+        scope,
+        ({ entry, sessionKey }) => {
+          if (selected.has(sessionKey)) {
+            const prepared = prepareLegacySessionCompactionHistory(entry);
+            fingerprints.set(
+              sessionKey,
+              JSON.stringify([prepared.entry.retainedHistoryReferences, prepared.eventFacts]),
+            );
+            eventFacts.push(...prepared.eventFacts);
+            for (const fact of prepared.eventFacts) {
+              transcriptIds.add(fact.sessionId);
+            }
+          }
+        },
+        identity,
+      );
+      // Existing markers must agree across owner rows, including different rewrite batches.
+      preparedTransforms.set(
+        target.sqlitePath,
+        createLegacyCompactionTranscriptTransform(eventFacts),
+      );
+      preparedFacts.set(target.sqlitePath, fingerprints);
+      if (transcriptIds.size > 0) {
+        const { restoreSessionColdTranscript } =
+          await import("../config/sessions/session-cold-storage.js");
+        for (const sessionId of transcriptIds) {
+          await restoreSessionColdTranscript({ ...scope, sessionId }, () =>
+            assertTargetCurrent(target),
+          );
+        }
+      }
+      assertTargetCurrent(target);
+    }
     report.repaired = plan.apply(assertTargetCurrent);
     for (const { target, scope, identity } of plan.pending) {
       assertTargetCurrent(target);

@@ -2,7 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { readSessionArchiveContentSync } from "../config/sessions/archive-compression.js";
-import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
+import { SessionStoreMigrationRequiredError } from "../config/sessions/migration-required.js";
+import {
+  resolveSessionArtifactDirectory,
+  resolveSessionStorePathCore,
+} from "../config/sessions/paths.js";
 import {
   loadExactSessionEntryReadOnly,
   loadTranscriptEvents,
@@ -15,12 +19,125 @@ import {
   openOpenClawAgentDatabase,
 } from "../state/openclaw-agent-db.js";
 import { withStateDirEnv } from "../test-helpers/state-dir-env.js";
+import { classifyDoctorMaintenanceRefusal } from "./doctor-maintenance-inspection.js";
 import { repairCanonicalSessionKeys } from "./doctor-session-canonical-keys.js";
 import { insertLegacySession } from "./doctor-session-canonical-keys.test-support.js";
 
 afterEach(() => closeOpenClawAgentDatabasesForTest());
 
 describe("doctor canonical session-key retention repair", () => {
+  it.each([
+    "missing generation",
+    "conflicting generation",
+    "protected artifact",
+    "dot-prefixed artifact",
+  ] as const)("refuses losing %s before changing either store", async (scenario) => {
+    await withStateDirEnv("openclaw-doctor-history-custody-", async ({ stateDir }) => {
+      const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+      const storeTemplate = path.join(stateDir, "agents", "{agentId}", "sessions.json");
+      const mainStore = resolveSessionStorePathCore(storeTemplate, { agentId: "main", env });
+      const opsStore = resolveSessionStorePathCore(storeTemplate, { agentId: "ops", env });
+      const cfg: OpenClawConfig = {
+        agents: { entries: { main: {}, ops: {} } },
+        session: { mainKey: "shared", store: storeTemplate },
+      };
+      const artifact = path.join(
+        resolveSessionArtifactDirectory(opsStore),
+        scenario === "dot-prefixed artifact" ? "..archive" : "",
+        "held.compact.jsonl",
+      );
+      const artifactBytes = "original protected artifact\n";
+      const hasArtifact = scenario === "protected artifact" || scenario === "dot-prefixed artifact";
+      if (hasArtifact) {
+        fs.mkdirSync(path.dirname(artifact), { recursive: true });
+        fs.writeFileSync(artifact, artifactBytes);
+      }
+      if (scenario !== "protected artifact") {
+        insertLegacySession({
+          agentId: "main",
+          env,
+          storePath: mainStore,
+          sessionKey: "agent:main:shared",
+          entry: { sessionId: "winner", updatedAt: 20 },
+          eventText: "winner history",
+        });
+      }
+      insertLegacySession({
+        agentId: "ops",
+        env,
+        storePath: opsStore,
+        sessionKey: "agent:main:shared ",
+        entry: {
+          sessionId: "held",
+          updatedAt: 10,
+          retainedHistoryReferences: {
+            sessionIds: hasArtifact ? [] : ["held"],
+            artifactPaths: hasArtifact ? [artifact] : [],
+          },
+        },
+        eventText: "original protected history",
+      });
+      const source = openOpenClawAgentDatabase({
+        agentId: "ops",
+        env,
+        path: resolveSqliteTargetFromSessionStorePath(opsStore, { agentId: "ops", env }).path,
+      });
+      const destinationPath = resolveSqliteTargetFromSessionStorePath(mainStore, {
+        agentId: "main",
+        env,
+      }).path;
+      const destination =
+        scenario === "protected artifact"
+          ? undefined
+          : openOpenClawAgentDatabase({
+              agentId: "main",
+              env,
+              path: destinationPath,
+            });
+      if (scenario === "conflicting generation") {
+        destination!.db
+          .prepare(
+            "INSERT INTO session_windows (session_id, session_key, reason, session_scope, created_at, updated_at) VALUES ('held', 'agent:main:shared', 'recovery', 'conversation', 10, 10)",
+          )
+          .run();
+        destination!.db
+          .prepare(
+            "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES ('held', 0, ?, 10)",
+          )
+          .run(
+            '{"type":"message","id":"different","message":{"role":"user","content":"different history"}}',
+          );
+      }
+      const snapshot = (database: typeof source) => ({
+        nodes: database.db.prepare("SELECT * FROM session_nodes ORDER BY session_key").all(),
+        windows: database.db.prepare("SELECT * FROM session_windows ORDER BY session_id").all(),
+        events: database.db
+          .prepare("SELECT * FROM transcript_events ORDER BY session_id, seq")
+          .all(),
+        contract: database.db.prepare("SELECT * FROM session_key_contract").all(),
+      });
+      const originalSource = snapshot(source);
+      const originalDestination = destination && snapshot(destination);
+      const error = await repairCanonicalSessionKeys({ apply: true, cfg, env }).catch(
+        (failure: unknown) => failure,
+      );
+      expect(error).toBeInstanceOf(SessionStoreMigrationRequiredError);
+      expect(classifyDoctorMaintenanceRefusal(error)).toEqual({
+        kind: "data-at-risk",
+        reason: "incomplete-migration",
+      });
+      expect(snapshot(source)).toEqual(originalSource);
+      if (destination) {
+        expect(snapshot(destination)).toEqual(originalDestination);
+      } else {
+        expect(fs.existsSync(destinationPath)).toBe(false);
+      }
+      if (hasArtifact) {
+        expect(fs.readFileSync(artifact, "utf8")).toBe(artifactBytes);
+      }
+    });
+  });
+
   it("copies only a cross-store winner and archives its stale same-store duplicate", async () => {
     await withStateDirEnv("openclaw-doctor-canonical-cross-store-", async ({ stateDir }) => {
       const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
@@ -72,6 +189,12 @@ describe("doctor canonical session-key retention repair", () => {
         agentId: "ops",
         entry: {
           previousSessionId: "destination-only-previous",
+          retainedHistoryReferences: {
+            sessionIds: ["winner", "already-missing"],
+            artifactPaths: [
+              path.join(resolveSessionArtifactDirectory(opsStore), "already-missing.compact.jsonl"),
+            ],
+          },
           sessionId: "winner",
           updatedAt: 20,
         },

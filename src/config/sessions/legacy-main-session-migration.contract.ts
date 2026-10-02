@@ -1,6 +1,6 @@
 import type { OpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
 import type { SqliteSessionGenerationClaim } from "./session-accessor.sqlite-generation.types.js";
-import type { SessionEntry } from "./types.js";
+import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 export type LegacyMainSessionMigrationMode = "detect" | "doctor-fix";
 

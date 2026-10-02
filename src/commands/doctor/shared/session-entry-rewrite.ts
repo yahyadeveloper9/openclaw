@@ -24,7 +24,10 @@ import { executeSqliteQuerySync, iterateSqliteQuerySync } from "../../../infra/k
 import type { DatabaseFileIdentity } from "../../../infra/sqlite-worker-identity.js";
 import { assertOpenClawAgentDatabaseIdentity } from "../../../state/openclaw-agent-db-identity.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../../../state/openclaw-agent-db-readonly.js";
-import { runOpenClawAgentWriteTransaction } from "../../../state/openclaw-agent-db.js";
+import {
+  runOpenClawAgentWriteTransaction,
+  type OpenClawAgentDatabase,
+} from "../../../state/openclaw-agent-db.js";
 import { chunkItems } from "../../../utils/chunk-items.js";
 import {
   deliveryContextFromSession,
@@ -67,6 +70,7 @@ export function scanDoctorSessionEntryRecords(
             WHERE key IN (${sql.join(LEGACY_SESSION_ENTRY_STATE_FIELDS)})
               OR key IN ('provider', 'lastProvider', 'room')
               OR (key = 'pendingFinalDelivery' AND type IN ('true', 'false'))
+              OR key = 'compactionCheckpoints'
           ) ELSE 1 END`,
         ),
     )) {
@@ -97,6 +101,7 @@ export function rewriteDoctorSessionEntries(
           entry: Record<string, unknown>,
           sessionKey: string,
           updatedAt: number,
+          database: OpenClawAgentDatabase,
         ) => Record<string, unknown>;
         transform?: never;
       }
@@ -149,7 +154,7 @@ export function rewriteDoctorSessionEntries(
             const previousFields = new Map(
               Object.entries(entry).map(([key, value]) => [key, JSON.stringify(value)]),
             );
-            const transformed = params.rawTransform(entry, sessionKey, row.updated_at);
+            const transformed = params.rawTransform(entry, sessionKey, row.updated_at, database);
             if (
               transformed.sessionId !== previousSessionId ||
               transformed.updatedAt !== previousUpdatedAt

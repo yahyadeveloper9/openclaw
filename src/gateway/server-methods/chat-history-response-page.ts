@@ -14,24 +14,17 @@ import {
 } from "./chat-history-budget.js";
 import {
   capChatHistoryAroundMessage,
-  enrichChatHistoryCompactionMarkers,
   resolveChatHistoryNextOffset,
 } from "./chat-history-page-kernel.js";
 
 export function prepareChatHistoryResponsePage(
   historyPage: ChatHistoryPage,
   {
-    entry: historyEntry,
-    compactionMetrics,
     maxHistoryBytes: responseHistoryBytes,
     messageId,
-  }: Pick<ChatHistoryPageParams, "entry" | "compactionMetrics" | "maxHistoryBytes" | "messageId">,
+  }: Pick<ChatHistoryPageParams, "maxHistoryBytes" | "messageId">,
 ): ChatHistoryResponsePage {
-  const normalized = enrichChatHistoryCompactionMarkers(
-    historyPage.messages,
-    historyEntry,
-    compactionMetrics,
-  );
+  const normalized = historyPage.messages;
   // A smaller page budget must not replace otherwise readable messages. The
   // tail cap keeps one whole message; the server's single-message cap still applies.
   const activity = createChatHistoryActivityProjection(normalized, historyPage.activity);

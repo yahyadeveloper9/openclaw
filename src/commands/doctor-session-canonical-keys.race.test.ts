@@ -1,11 +1,12 @@
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import {
   listCanonicalSessionRepairFacts,
   loadCanonicalSessionRepairEntries,
   loadExactSessionEntryReadOnly,
 } from "../config/sessions/session-accessor.js";
+import * as lifecycle from "../config/sessions/session-accessor.sqlite-projection.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
@@ -17,9 +18,89 @@ import { normalizeSessionDeliveryState } from "../utils/delivery-context.shared.
 import { repairCanonicalSessionKeys } from "./doctor-session-canonical-keys.js";
 import { insertLegacySession } from "./doctor-session-canonical-keys.test-support.js";
 
-afterEach(() => closeOpenClawAgentDatabasesForTest());
+afterEach(() => {
+  vi.restoreAllMocks();
+  closeOpenClawAgentDatabasesForTest();
+});
 
 describe("doctor canonical session decision races", () => {
+  it("retains the source when protected destination history changes before source cleanup", async () => {
+    await withStateDirEnv("openclaw-doctor-canonical-custody-race-", async ({ stateDir }) => {
+      const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+      const storeTemplate = path.join(stateDir, "agents", "{agentId}", "sessions.json");
+      const sourceStore = resolveSessionStorePathCore(storeTemplate, { agentId: "ops", env });
+      const destinationStore = resolveSessionStorePathCore(storeTemplate, { agentId: "main", env });
+      const sourceKey = "agent:main:work ";
+      insertLegacySession({
+        agentId: "ops",
+        env,
+        storePath: sourceStore,
+        sessionKey: sourceKey,
+        entry: {
+          sessionId: "protected-session",
+          updatedAt: 20,
+          retainedHistoryReferences: { sessionIds: ["protected-session"], artifactPaths: [] },
+        },
+        eventText: "protected source history",
+      });
+      const source = openOpenClawAgentDatabase({
+        agentId: "ops",
+        env,
+        path: resolveSqliteTargetFromSessionStorePath(sourceStore, { agentId: "ops", env }).path,
+      });
+      const readSource = () => ({
+        nodes: source.db.prepare("SELECT * FROM session_nodes ORDER BY session_key").all(),
+        windows: source.db.prepare("SELECT * FROM session_windows ORDER BY session_id").all(),
+        events: source.db.prepare("SELECT * FROM transcript_events ORDER BY session_id, seq").all(),
+      });
+      let sourceBeforeCleanup: ReturnType<typeof readSource> | undefined;
+      const applyMutation = lifecycle.applySessionEntryLifecycleMutation;
+      vi.spyOn(lifecycle, "applySessionEntryLifecycleMutation").mockImplementation(
+        async (params) => {
+          const result = await applyMutation(params);
+          if (params.storePath === destinationStore) {
+            sourceBeforeCleanup = readSource();
+            const destination = openOpenClawAgentDatabase({
+              agentId: "main",
+              env,
+              path: resolveSqliteTargetFromSessionStorePath(destinationStore, {
+                agentId: "main",
+                env,
+              }).path,
+            });
+            destination.db
+              .prepare(
+                "UPDATE transcript_events SET event_json = ? WHERE session_id = ? AND seq = 0",
+              )
+              .run(
+                JSON.stringify({
+                  type: "message",
+                  id: "protected-session-message",
+                  parentId: null,
+                  message: { role: "user", content: "concurrent destination rewrite" },
+                }),
+                "protected-session",
+              );
+          }
+          return result;
+        },
+      );
+
+      await expect(
+        repairCanonicalSessionKeys({
+          apply: true,
+          cfg: {
+            agents: { entries: { main: {}, ops: {} } },
+            session: { mainKey: "work", store: storeTemplate },
+          },
+          env,
+        }),
+      ).rejects.toThrow("Protected transcript protected-session");
+      expect(sourceBeforeCleanup).toBeDefined();
+      expect(readSource()).toEqual(sourceBeforeCleanup);
+    });
+  });
+
   it("rejects stale canonical facts after delivery evidence changes", async () => {
     await withStateDirEnv("openclaw-doctor-canonical-stale-fact-", async ({ stateDir }) => {
       const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };

@@ -15,6 +15,7 @@ import { publishSessionEntryCacheInvalidation } from "./session-accessor.sqlite-
 import { writeSessionEntry } from "./session-accessor.sqlite-entry-store.js";
 import {
   withSqliteSessionImportStage,
+  type DoctorCompactionTranscriptTransform,
   type SqliteSessionImportStage,
 } from "./session-accessor.sqlite-import-stage.js";
 import { invalidateSessionEntryMaintenanceAgeFact } from "./session-accessor.sqlite-maintenance-age.js";
@@ -28,7 +29,10 @@ import {
   advanceTranscriptMutationAtInTransaction,
   touchTranscriptMutationInTransaction,
 } from "./session-accessor.sqlite-transcript-state.js";
-import { appendTranscriptEventsInTransaction } from "./session-accessor.sqlite-transcript-store.js";
+import {
+  appendTranscriptEventInTransaction,
+  appendTranscriptEventsInTransaction,
+} from "./session-accessor.sqlite-transcript-store.js";
 import { assertSessionTranscriptHot } from "./session-cold-storage-state.js";
 import { reconcileSessionTranscriptIndexInTransaction } from "./session-transcript-index.js";
 import { transcriptEventJsonSql } from "./transcript-payload.js";
@@ -49,8 +53,11 @@ type SqliteSessionImportRowsParams = Pick<
   preserveExactStoredKey?: boolean;
   entry: SessionEntry;
   legacyAcpMigrationSource?: LegacyAcpMigrationSource;
-  readTranscriptEvents?: (append: (event: TranscriptEvent) => void) => void | (() => void);
+  readTranscriptEvents?: (
+    append: (event: TranscriptEvent, eventJson?: string) => void,
+  ) => void | (() => void);
   transcriptMtimeMs?: number;
+  doctorCompactionTranscriptTransform?: DoctorCompactionTranscriptTransform;
 };
 
 /** Summary of rows written by an internal doctor/migration import. */
@@ -149,14 +156,47 @@ function importSqliteSessionRowsInTransaction(
         .select(transcriptEventJsonSql(database.db).as("event_json"))
         .where("session_id", "=", params.entry.sessionId),
     )) {
-      stage.addSeen(row.event_json);
+      stage.addSeen(
+        params.doctorCompactionTranscriptTransform?.(
+          database.db,
+          params.entry.sessionId,
+          row.event_json,
+        ) ?? row.event_json,
+      );
     }
-    transcriptEvents = appendTranscriptEventsInTransaction(
-      database,
-      transcriptScope,
-      stage.iterateUnseenEvents(source),
-      { allowStoredAlias: true, scheduleProjectionReconcile: false, touchMutation: false },
-    );
+    const appendOptions = {
+      allowStoredAlias: true,
+      scheduleProjectionReconcile: false,
+      touchMutation: false,
+    };
+    if (params.doctorCompactionTranscriptTransform) {
+      const rows = stage.iterateUnseenRows(source);
+      try {
+        let next = rows.next();
+        while (!next.done) {
+          const { eventJson } = next.value;
+          // SAFETY: the source reader validated this event before staging its exact JSON.
+          const event = JSON.parse(eventJson) as TranscriptEvent;
+          const inserted = appendTranscriptEventInTransaction(database, transcriptScope, event, {
+            ...appendOptions,
+            eventJson,
+          });
+          if (inserted !== false) {
+            transcriptEvents += 1;
+          }
+          next = rows.next(inserted !== false);
+        }
+      } finally {
+        rows.return();
+      }
+    } else {
+      transcriptEvents = appendTranscriptEventsInTransaction(
+        database,
+        transcriptScope,
+        stage.iterateUnseenEvents(source),
+        appendOptions,
+      );
+    }
     // Doctor imports run outside gateway requests and must finish with a complete projection.
     reconcileSessionTranscriptIndexInTransaction(database.db, params.entry.sessionId);
     publishSessionEntryCacheInvalidation(database, { sessionKey: resolved.sessionKey });
@@ -189,6 +229,7 @@ function importSqliteSessionRowsInTransaction(
 /** Imports legacy session rows that share one SQLite store in one durable transaction. */
 export async function importSqliteSessionRowsBatch(
   params: readonly SqliteSessionImportRowsParams[],
+  options: { applyDoctorCompactionHistory?: (database: OpenClawAgentDatabase) => void } = {},
 ): Promise<SqliteSessionImportRowsResult[]> {
   if (params.length === 0) {
     return [];
@@ -215,8 +256,14 @@ export async function importSqliteSessionRowsBatch(
         >();
         for (const [source, { params: importParams }] of prepared.entries()) {
           let seq = 0;
-          const validate = importParams.readTranscriptEvents?.((event) =>
-            stage.append(source, seq++, JSON.stringify(event)),
+          const doctorCompaction = importParams.doctorCompactionTranscriptTransform
+            ? {
+                sessionId: importParams.entry.sessionId,
+                transform: importParams.doctorCompactionTranscriptTransform,
+              }
+            : undefined;
+          const validate = importParams.readTranscriptEvents?.((event, eventJson) =>
+            stage.append(source, seq++, eventJson ?? JSON.stringify(event), doctorCompaction),
           );
           if (validate) {
             validators.push(validate);
@@ -226,7 +273,7 @@ export async function importSqliteSessionRowsBatch(
           }
         }
         // Recheck every source after the last reader, before any canonical transaction.
-        // No filesystem readers or callbacks cross the synchronous SQLite commit boundary.
+        // No filesystem readers or source validators cross the synchronous SQLite commit boundary.
         for (const validate of validators) {
           validate();
         }
@@ -249,7 +296,7 @@ export async function importSqliteSessionRowsBatch(
                 "Session recovery history cannot be verified; SQLite destination is not empty",
               );
             }
-            return prepared.map((row, source) =>
+            const imported = prepared.map((row, source) =>
               importSqliteSessionRowsInTransaction(
                 database,
                 row,
@@ -258,6 +305,8 @@ export async function importSqliteSessionRowsBatch(
                 repairs.get(source),
               ),
             );
+            options.applyDoctorCompactionHistory?.(database);
+            return imported;
           },
           toDatabaseOptions(resolved),
           { operationLabel: "session.import.batch" },

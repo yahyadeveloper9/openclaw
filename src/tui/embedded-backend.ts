@@ -70,7 +70,6 @@ import {
   createChatHistoryByteCounter,
   replaceOversizedChatHistoryMessages,
 } from "../gateway/server-methods/chat-history-budget.js";
-import { enrichChatHistoryCompactionMarkers } from "../gateway/server-methods/chat-history-page-kernel.js";
 import { readChatHistoryPage } from "../gateway/server-methods/chat-history-pages.js";
 import { buildModelsListResult } from "../gateway/server-methods/models-list-result.js";
 import { createGatewaySession } from "../gateway/session-create-service.js";
@@ -503,7 +502,7 @@ export class EmbeddedTuiBackend implements TuiBackend {
       offset: undefined,
       messageId: undefined,
     });
-    const normalized = enrichChatHistoryCompactionMarkers(historyPage.messages, entry);
+    const normalized = historyPage.messages;
     const activity = createChatHistoryActivityProjection(normalized, historyPage.activity);
     const byteCounter = createChatHistoryByteCounter(activity);
     const perMessageHardCap = Math.min(CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES, maxHistoryBytes);

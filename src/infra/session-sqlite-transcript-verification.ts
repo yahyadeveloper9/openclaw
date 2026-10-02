@@ -1,7 +1,10 @@
 /** Shared read-only proof that retained transcript events exist in canonical SQLite. */
 import type { DatabaseSync } from "node:sqlite";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { withSqliteSessionImportStage } from "../config/sessions/session-accessor.sqlite-import-stage.js";
+import {
+  withSqliteSessionImportStage,
+  type DoctorCompactionTranscriptTransform,
+} from "../config/sessions/session-accessor.sqlite-import-stage.js";
 import { getSessionKysely } from "../config/sessions/session-accessor.sqlite-scope.js";
 import { transcriptEventJsonSql } from "../config/sessions/transcript-payload.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
@@ -13,18 +16,29 @@ import {
 
 export function verifyTranscriptEvents(
   database: DatabaseSync,
-  source: { path: string; sessionId: string; originalPath: string },
+  source: {
+    path: string;
+    sessionId: string;
+    originalPath: string;
+    doctorCompactionTranscriptTransform?: DoctorCompactionTranscriptTransform;
+  },
   mode: "ordered" | "contained" | "appendable" = "ordered",
 ): { events: number; missingEvents: number; sqliteEvents: number } | undefined {
   return withSqliteSessionImportStage((stage) => {
     let seq = 0;
+    const doctorCompaction = source.doctorCompactionTranscriptTransform
+      ? { sessionId: source.sessionId, transform: source.doctorCompactionTranscriptTransform }
+      : undefined;
     const validate = createTranscriptEventReader(
       source.path,
       source.sessionId,
       false,
       readTranscriptFingerprint(source.path),
       source.originalPath,
-    )((event) => stage.append(0, seq++, JSON.stringify(event)));
+      { preserveEventJson: doctorCompaction !== undefined },
+    )((event, eventJson) =>
+      stage.append(0, seq++, eventJson ?? JSON.stringify(event), doctorCompaction),
+    );
     if (mode === "ordered") {
       const repair = stage.repairLegacyTranscript(0);
       // Receipt adoption retains its original order and branch-repair contract.
@@ -51,14 +65,23 @@ export function verifyTranscriptEvents(
           .where("session_id", "=", source.sessionId)
           .orderBy("seq", "asc"),
       )) {
+        // Append admission compares the planned repair; post-import proof requires stored facts.
+        const eventJson =
+          mode === "appendable"
+            ? (source.doctorCompactionTranscriptTransform?.(
+                database,
+                source.sessionId,
+                event.event_json,
+              ) ?? event.event_json)
+            : event.event_json;
         if (mode !== "ordered") {
-          stage.addSeen(event.event_json);
-          const entry: unknown = JSON.parse(event.event_json);
+          stage.addSeen(eventJson);
+          const entry: unknown = JSON.parse(eventJson);
           if (isRecord(entry) && typeof entry.id === "string") {
             stage.addSeen(`id\0${entry.id}`);
           }
         }
-        if (!expected.done && event.event_json === expected.value.eventJson) {
+        if (!expected.done && eventJson === expected.value.eventJson) {
           expected = sourceRows.next();
           if (expected.done) {
             break;
@@ -110,7 +133,12 @@ export function verifyTranscriptEvents(
 /** Read-only content proof for Doctor's informational missing-index finding. */
 export function verifyCanonicalSessionTranscriptSources(params: {
   target: { agentId: string; sqlitePath: string };
-  sources: readonly { path: string; sessionId: string; originalPath?: string }[];
+  sources: readonly {
+    path: string;
+    sessionId: string;
+    originalPath?: string;
+    doctorCompactionTranscriptTransform?: DoctorCompactionTranscriptTransform;
+  }[];
   env: NodeJS.ProcessEnv;
   mode?: "ordered" | "contained" | "appendable";
 }): { entries: number; events: number; missingEvents: number; sqliteEvents: number } | undefined {

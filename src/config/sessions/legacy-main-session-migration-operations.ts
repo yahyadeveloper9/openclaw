@@ -31,6 +31,7 @@ import type {
   PhysicalStore,
   SessionClaim,
 } from "./legacy-main-session-migration.contract.js";
+import { resolveSessionArtifactDirectory } from "./paths.js";
 import {
   runSqliteSessionDeletionTransaction,
   withSqliteSessionDeletions,
@@ -56,8 +57,9 @@ import {
   runExclusiveSqliteSessionWrite,
 } from "./session-accessor.sqlite-scope.js";
 import { assertSessionTranscriptHot } from "./session-cold-storage-state.js";
+import { assertRetainedHistoryArtifactTransfer } from "./session-retained-history.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
-import type { SessionEntry } from "./types.js";
+import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 export function samePhysicalStore(left: PhysicalStore, right: PhysicalStore): boolean {
   return isSameOpenClawAgentDatabasePath(left.path, right.path);
@@ -72,6 +74,28 @@ function freshestClaim(claims: readonly SessionClaim[]): SessionClaim {
       left.store.path.localeCompare(right.store.path)
     );
   })[0]!;
+}
+
+/** Check definite transfers before cold restoration; divergent claims retain their store owner. */
+export function assertLegacyMainSessionHistoryCustody(params: {
+  claims: readonly SessionClaim[];
+  destination: PhysicalStore;
+  destinationCanonical?: SessionClaim;
+}): void {
+  const winner = params.destinationCanonical ?? freshestClaim(params.claims);
+  for (const claim of params.claims) {
+    if (
+      samePhysicalStore(claim.store, params.destination) ||
+      (claim !== winner && !claimsMatch(claim, winner))
+    ) {
+      continue;
+    }
+    assertRetainedHistoryArtifactTransfer(
+      claim.entry.retainedHistoryReferences,
+      resolveSessionArtifactDirectory(claim.store.ownerStorePath),
+      resolveSessionArtifactDirectory(params.destination.ownerStorePath),
+    );
+  }
 }
 
 export function warningForDivergence(
@@ -234,6 +258,11 @@ async function copyClaimCrossStore(params: {
                 ) {
                   return undefined;
                 }
+                assertRetainedHistoryArtifactTransfer(
+                  fresh.entry.retainedHistoryReferences,
+                  resolveSessionArtifactDirectory(params.source.store.ownerStorePath),
+                  resolveSessionArtifactDirectory(params.destination.ownerStorePath),
+                );
                 const destinationWindows = new Map(
                   readSqliteSessionGenerationWindows(
                     destinationDatabase,
@@ -442,6 +471,13 @@ async function deleteCopiedClaims(params: {
     const assertCopied = () => {
       params.beforePersistentApply?.();
       assertCurrent();
+      for (const source of sources) {
+        assertRetainedHistoryArtifactTransfer(
+          source.entry.retainedHistoryReferences,
+          resolveSessionArtifactDirectory(source.store.ownerStorePath),
+          resolveSessionArtifactDirectory(params.destination.ownerStorePath),
+        );
+      }
       const version = readSqliteDataVersion(destinationReader.db);
       if (version === verifiedVersion) {
         return;
@@ -548,6 +584,16 @@ export async function processIdenticalClaims(params: {
   });
   if (params.mode !== "doctor-fix") {
     return completedOutcome();
+  }
+
+  for (const source of params.aliases) {
+    if (!samePhysicalStore(source.store, params.destination)) {
+      assertRetainedHistoryArtifactTransfer(
+        source.entry.retainedHistoryReferences,
+        resolveSessionArtifactDirectory(source.store.ownerStorePath),
+        resolveSessionArtifactDirectory(params.destination.ownerStorePath),
+      );
+    }
   }
 
   let canonical = params.canonical;

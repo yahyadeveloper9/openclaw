@@ -10,7 +10,6 @@ import {
   hasSessionPendingInputsSchema,
   hasPendingInputConsumptionColumn,
 } from "../../state/openclaw-agent-pending-inputs-schema.js";
-import { readLegacyCompactionHistory } from "./legacy-compaction-history.js";
 import { parseSqliteSessionEntryRecord } from "./session-entry-json.js";
 import { projectCanonicalSessionEntryShape } from "./store-entry-shape.js";
 
@@ -66,16 +65,10 @@ export function readSessionColdStorageProtection(
         protectedIds.add(id);
       }
     }
-    for (const checkpoint of readLegacyCompactionHistory(entry)) {
+    for (const id of entry.retainedHistoryReferences?.sessionIds ?? []) {
       // A self-reference is not cross-generation; the current window stays governed by activity.
-      for (const id of [
-        checkpoint.sessionId,
-        checkpoint.preCompaction.sessionId,
-        checkpoint.postCompaction.sessionId,
-      ]) {
-        if (id && id !== row.current_session_id) {
-          protectedIds.add(id);
-        }
+      if (id !== row.current_session_id) {
+        protectedIds.add(id);
       }
     }
   }
