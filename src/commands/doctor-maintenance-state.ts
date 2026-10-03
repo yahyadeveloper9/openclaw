@@ -156,8 +156,10 @@ export function createDoctorMaintenanceState(options: {
       // This runs before the long-lived Doctor callback: closing its own tracked
       // callback would self-wait. Include CLI/bootstrap resources predating this scope.
       await closeResources();
-      await closeOpenClawAgentDatabasesAsync(sourceDir);
-      await closeOpenClawStateDatabaseByPathAsync(sourceDatabase);
+      await owner!.run(async () => {
+        await closeOpenClawAgentDatabasesAsync(sourceDir);
+        await closeOpenClawStateDatabaseByPathAsync(sourceDatabase);
+      });
       await settleCapture();
       const migration = owner!.run(() => {
         options.assertCurrent?.();
@@ -197,10 +199,10 @@ export function createDoctorMaintenanceState(options: {
       options.assertCurrent?.();
       owner!.assertCurrent();
       await closeResources();
-      await closeOpenClawAgentDatabasesAsync(stateDir);
-      await closeOpenClawStateDatabaseByPathAsync(databasePath);
       try {
         return await owner!.run(async () => {
+          await closeOpenClawAgentDatabasesAsync(stateDir);
+          await closeOpenClawStateDatabaseByPathAsync(databasePath);
           // Agent admission writes through shared state; retain that owner after drainage.
           await assertDoctorAgentLeaseAdmission(selectedEnv);
           return repairDoctorSqliteNoCow({
