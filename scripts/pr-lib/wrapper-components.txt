@@ -937,6 +937,7 @@ src/infra/sqlite-snapshot-policy.ts
 src/infra/sqlite-snapshot-retirement.ts
 src/infra/sqlite-snapshot-single-flight.ts
 src/infra/sqlite-snapshot-source.ts
+src/infra/sqlite-snapshot-staging-allocation.ts
 src/infra/sqlite-snapshot-staging-owner.ts
 src/infra/sqlite-snapshot-staging.ts
 src/infra/sqlite-snapshot-wal-prefix.ts
@@ -1433,6 +1434,7 @@ src/shared/avatar-limits.ts
 src/shared/avatar-policy.ts
 src/shared/dedupe-by-key.ts
 src/shared/deferred.ts
+src/shared/detached-async-context.ts
 src/shared/dot-path.ts
 src/shared/env-var-candidates.ts
 src/shared/freebsd-process-identity-native.ts
