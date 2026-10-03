@@ -47,14 +47,15 @@ export function createDoctorMaintenanceState(options: {
     assertCurrent: () => owner!.assertCurrent(options.assertCurrent),
     warn: options.warn,
   });
-  const closeResources = async () => {
+  const closeResources = async (agentRoot?: string) => {
+    const drainRoot = agentRoot ?? (resourcesParent ? undefined : resolveStateDir(selectedEnv));
     await resources?.close(
-      resourcesParent
+      drainRoot === undefined
         ? undefined
         : async () => {
             const { closeOpenClawAgentDatabasesAsync } =
               await import("../state/openclaw-agent-db-lifecycle.js");
-            await closeOpenClawAgentDatabasesAsync(resolveStateDir(selectedEnv));
+            await closeOpenClawAgentDatabasesAsync(drainRoot);
           },
     );
     await inspections?.close();
@@ -165,7 +166,7 @@ export function createDoctorMaintenanceState(options: {
       const sourceDatabase = resolveOpenClawStateSqlitePath(env);
       // This runs before the long-lived Doctor callback. Include CLI/bootstrap
       // resources predating this scope before moving the owned state root.
-      await closeResources();
+      await closeResources(sourceDir);
       await closeOpenClawStateDatabaseByPathAsync(sourceDatabase);
       await settleCapture();
       const migration = owner!.run(() => {
@@ -203,7 +204,7 @@ export function createDoctorMaintenanceState(options: {
       const databasePath = resolveOpenClawStateSqlitePath(selectedEnv);
       options.assertCurrent?.();
       owner!.assertCurrent();
-      await closeResources();
+      await closeResources(stateDir);
       await closeOpenClawStateDatabaseByPathAsync(databasePath);
       try {
         return await owner!.run(async () => {
