@@ -22,6 +22,10 @@ import {
   captureOpenClawAgentDatabaseExecution,
   supportsOpenClawAgentDatabaseExecution,
 } from "../../state/openclaw-agent-execution.js";
+import {
+  getOpenClawDatabaseMaintenanceScope,
+  type OpenClawDatabaseMaintenanceScope,
+} from "../../state/openclaw-state-db-async-lifecycle.js";
 import { cloneEnvWithPlatformSemantics } from "../config-env-vars.js";
 import { resolveStateDir } from "../state-dir.js";
 import {
@@ -54,6 +58,7 @@ type SessionEntryMaintenanceRequest = {
   storePath: string;
 };
 type SessionEntryMaintenanceOwner = SessionEntryMaintenanceRequest & {
+  maintenanceScope?: OpenClawDatabaseMaintenanceScope;
   activeSessionKeys: Set<string>;
   ageOwner: string;
   ageChanges: Map<string, SessionEntryMaintenanceAgeChange>;
@@ -134,12 +139,14 @@ export function kickSessionEntryMaintenanceAfterWrite(
   const created: SessionEntryMaintenanceOwner = {
     ...params,
     scope,
+    maintenanceScope: getOpenClawDatabaseMaintenanceScope(),
     activeSessionKeys: new Set([params.activeSessionKey]),
     ageOwner: randomUUID(),
     ageChanges: new Map(),
     captureExecution,
     execution: captureExecution(),
     assertCurrent: () => {
+      created.maintenanceScope?.assertAdmission();
       assertAdmitted();
       created.execution?.assertCurrent();
       if (identity) {
@@ -299,7 +306,15 @@ function scheduleMaintenanceAfterWriteQuiet(
 
 function startPendingMaintenance(databasePath: string, owner: SessionEntryMaintenanceOwner): void {
   // Publish the join before a pass can synchronously retire itself.
-  owner.active = Promise.resolve().then(() => runPendingMaintenance(databasePath, owner));
+  owner.active = Promise.resolve().then(() => {
+    if (!isMaintenanceOwnerCurrent(databasePath, owner)) {
+      retireMaintenanceOwner(databasePath, owner);
+      return undefined;
+    }
+    const run = () => runPendingMaintenance(databasePath, owner);
+    // Detached scheduling must retain Doctor custody of borrowed handles and Workers.
+    return owner.maintenanceScope ? owner.maintenanceScope.run(run) : run();
+  });
 }
 
 async function runPendingMaintenance(
