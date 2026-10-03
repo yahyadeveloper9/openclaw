@@ -31,6 +31,7 @@ export type ChatMetadataPublication = {
   fail: (error: unknown) => void;
 };
 export type ChatMetadataRequest = {
+  controller: AbortController;
   promise: Promise<ChatMetadataResult>;
   publication: ChatMetadataPublication;
   revalidation: boolean;
@@ -42,6 +43,7 @@ export type ChatMetadataRefresh = {
   isCurrent: () => boolean;
 };
 export type ChatMetadataRefreshRecord = ChatMetadataRefresh & {
+  controller: AbortController;
   phase: "waiting" | "admitted" | "inactive";
   revision: number;
   catalogRevision: number;

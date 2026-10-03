@@ -703,4 +703,42 @@ describe("chat metadata store", () => {
     );
     expect(request).toHaveBeenCalledOnce();
   });
+
+  it.each(["ready", "released"] as const)(
+    "keeps agent startup metadata pending for minutes until %s",
+    async (outcome) => {
+      vi.useFakeTimers();
+      const starting = new GatewayRequestError({
+        code: "UNAVAILABLE",
+        message: "Agent main is still preparing its database.",
+        details: { code: "agent-database-inspection-pending", agentId: "main" },
+        retryable: true,
+        retryAfterMs: 250,
+      });
+      const request = vi.fn().mockRejectedValue(starting);
+      const client = clientWith(request);
+      const scope = { agentId: "main" };
+      const updates: string[] = [];
+      const release = subscribeChatMetadata(client, scope, (update) => updates.push(update.type));
+      const result = revalidateChatMetadata(client, scope).catch((error: unknown) => error);
+      try {
+        await vi.advanceTimersByTimeAsync(182_499);
+        expect(request).toHaveBeenCalledTimes(39);
+        expect(updates).not.toContain("error");
+        if (outcome === "ready") {
+          request.mockResolvedValue(metadata("ready"));
+          await vi.advanceTimersByTimeAsync(1);
+          expect(await result).toEqual(metadata("ready"));
+          expect(peekChatMetadata(client, scope)).toEqual(metadata("ready"));
+        } else {
+          release();
+          expect(await result).toHaveProperty("name", "AbortError");
+        }
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        release();
+        await result;
+      }
+    },
+  );
 });
