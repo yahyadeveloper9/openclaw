@@ -163,12 +163,12 @@ export async function applySessionEntryLifecycleMutation(
             upserts,
           });
         }
-        const deletedOwners = projected.removals.flatMap(({ sessionKey, expectedEntry: entry }) => {
-          return entry &&
-            !projected.upsertedEntries.some((upsert) => upsert.sessionKey === sessionKey)
-            ? [{ entry, sessionKey }]
-            : [];
-        });
+        const deletedOwners = projected.removals.flatMap((removal) =>
+          removal.kind !== "retained" &&
+          !projected.upsertedEntries.some((upsert) => upsert.sessionKey === removal.sessionKey)
+            ? [{ entry: removal.expectedEntry, sessionKey: removal.sessionKey }]
+            : [],
+        );
         const resetSources = projected.upsertedEntries.flatMap(
           ({ resetBoundary, expectedEntry }) =>
             resetBoundary && expectedEntry?.sessionId ? [expectedEntry.sessionId] : [],

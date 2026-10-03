@@ -92,18 +92,37 @@ function createPersonalMetadataFixture() {
 }
 
 describe("chat history model selection defaults", () => {
-  it("keeps a stored literal global conversation separate from main in per-sender scope", async () => {
+  it("keeps stored sentinel conversations separate from main and qualified keys in per-sender scope", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const cfg = {
         session: { scope: "per-sender" },
         agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
       } satisfies OpenClawConfig;
       await state.writeConfig(cfg);
-      for (const agentId of ["ops", "research"]) {
+      for (const sentinel of ["global", "unknown"]) {
+        for (const agentId of ["ops", "research"]) {
+          await upsertSessionEntryCore(
+            { agentId, sessionKey: sentinel },
+            { sessionId: `${sentinel}-${agentId}`, updatedAt: 1 },
+          );
+        }
+        const qualifiedKey = `agent:research:${sentinel}`;
         await upsertSessionEntryCore(
-          { agentId, sessionKey: "global" },
-          { sessionId: `global-${agentId}`, updatedAt: 1 },
+          { agentId: "research", sessionKey: qualifiedKey },
+          { sessionId: `qualified-${sentinel}-research`, updatedAt: 1 },
         );
+        for (const [sessionKey, sessionId] of [
+          [sentinel, `${sentinel}-research`],
+          [qualifiedKey, `qualified-${sentinel}-research`],
+        ]) {
+          await appendTranscriptMessage(
+            { agentId: "research", sessionKey, sessionId },
+            {
+              eventId: `${sessionId}-message`,
+              message: { role: "user", content: `Message for ${sessionKey}`, timestamp: 1 },
+            },
+          );
+        }
       }
       await upsertSessionEntryCore(
         { agentId: "research", sessionKey: "agent:research:main" },
@@ -112,26 +131,62 @@ describe("chat history model selection defaults", () => {
       const context = await createHistoryReadContext({ getRuntimeConfig: () => cfg });
       const client = identifiedClient("literal-global-operator");
       client.connect.scopes = ["operator.admin"];
-      for (const [sessionKey, sessionId] of [
-        ["global", "global-research"],
-        ["agent:research:main", "main-research"],
-      ]) {
+      const read = async (params: {
+        sessionKey: string;
+        sessionId?: string;
+        messageId?: string;
+      }) => {
         const respond = vi.fn<RespondFn>();
         await expectDefined(
           chatHistoryHandlers["chat.history"],
           "history handler",
         )({
-          params: { sessionKey, agentId: "research" },
+          params: { ...params, agentId: "research" },
           context,
           req: { type: "req", id: "literal-global", method: "chat.history" },
           client,
           isWebchatConnect: () => false,
           respond,
         });
-        expect(respond).toHaveBeenCalledWith(
+        return respond;
+      };
+      for (const [sessionKey, sessionId] of [
+        ["global", "global-research"],
+        ["agent:research:main", "main-research"],
+      ]) {
+        expect(await read({ sessionKey })).toHaveBeenCalledWith(
           true,
           expect.objectContaining({ sessionKey, sessionId }),
         );
+      }
+      for (const sentinel of ["global", "unknown"]) {
+        const qualifiedKey = `agent:research:${sentinel}`;
+        for (const [sessionKey, wrongSessionKey, sessionId] of [
+          [sentinel, qualifiedKey, `${sentinel}-research`],
+          [qualifiedKey, sentinel, `qualified-${sentinel}-research`],
+        ]) {
+          const messageId = `${sessionId}-message`;
+          expect(
+            await read({ sessionKey: wrongSessionKey, sessionId, messageId }),
+          ).toHaveBeenCalledExactlyOnceWith(
+            false,
+            undefined,
+            expect.objectContaining({
+              code: "INVALID_REQUEST",
+              message: "sessionId does not belong to sessionKey",
+            }),
+          );
+          expect(await read({ sessionKey, sessionId, messageId })).toHaveBeenCalledExactlyOnceWith(
+            true,
+            expect.objectContaining({
+              sessionKey,
+              sessionId,
+              messages: [
+                expect.objectContaining({ messageId, content: `Message for ${sessionKey}` }),
+              ],
+            }),
+          );
+        }
       }
     });
   });

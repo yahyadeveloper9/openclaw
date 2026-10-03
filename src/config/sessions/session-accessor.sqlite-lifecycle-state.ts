@@ -348,20 +348,43 @@ export function assertRawSessionEntryRemovalUnchanged(
   database: Pick<OpenClawAgentDatabase, "db">,
   sessionKey: string,
   removal: Extract<SessionEntryLifecycleRemoval, { expectedRawEntryJson: string }>,
+  options: { requireOwnedWindow?: boolean } = {},
 ): void {
   const row = executeSqliteQueryTakeFirstSync(
     database.db,
     getSessionKysely(database.db)
       .selectFrom("session_nodes")
-      .select(["entry_json", "snapshot_revision"])
+      .select([
+        "entry_json",
+        "snapshot_revision",
+        "current_session_id",
+        "entry_valid",
+        "updated_at",
+      ])
       .where("session_key", "=", sessionKey),
   );
   if (
     !row ||
     row.entry_json !== removal.expectedRawEntryJson ||
-    row.snapshot_revision !== removal.expectedSnapshotRevision
+    row.snapshot_revision !== removal.expectedSnapshotRevision ||
+    (removal.kind === "retained" &&
+      (row.current_session_id !== removal.expectedSessionId ||
+        row.entry_valid !== -1 ||
+        row.updated_at !== removal.expectedUpdatedAt))
   ) {
     throw new Error(`SQLite session entry changed before raw lifecycle removal for ${sessionKey}`);
+  }
+  if (removal.kind === "retained" && options.requireOwnedWindow !== false) {
+    const window = executeSqliteQueryTakeFirstSync(
+      database.db,
+      getSessionKysely(database.db)
+        .selectFrom("session_windows")
+        .select("session_key")
+        .where("session_id", "=", removal.expectedSessionId),
+    );
+    if (window?.session_key !== sessionKey) {
+      throw new Error(`SQLite retained session window changed before removal for ${sessionKey}`);
+    }
   }
 }
 
@@ -375,6 +398,19 @@ function selectProjectedLifecycleRemovals(
   const projectedRemovals: ProjectedLifecycleMutation["removals"] = [];
   for (const removal of removals) {
     const sessionKey = removal.exactStoredKey ? removal.sessionKey : removal.sessionKey.trim();
+    if (removal.kind === "retained") {
+      assertRawSessionEntryRemovalUnchanged(database, sessionKey, removal);
+      projectedRemovals.push({
+        kind: "retained",
+        archiveTranscript: false,
+        expectedEntry: null,
+        removal,
+        sessionKey,
+      });
+      changedSessionKeys.add(sessionKey);
+      delete store[sessionKey];
+      continue;
+    }
     let entry = removal.exactStoredKey || sessionKey ? store[sessionKey] : undefined;
     if (removal.expectedRawEntryJson !== undefined) {
       assertRawSessionEntryRemovalUnchanged(database, sessionKey, removal);
@@ -422,30 +458,43 @@ function finishProjectedLifecycleRemovalPlans(
 ): ProjectedLifecycleMutation {
   const { removedKeysToArchive, changedSessionKeys, projectedRemovals } = selected;
   const removedGenerationIds = readSessionGenerationIdsForKeys(database, removedKeysToArchive);
+  const retainedKeys = projectedRemovals.flatMap((removal) =>
+    removal.kind === "retained" ? [removal.sessionKey] : [],
+  );
+  const retainedSessionIds =
+    retainedKeys.length > 0
+      ? readSessionGenerationIdsForKeys(database, retainedKeys, { exactStoredKeys: true })
+      : [];
   const referencedSessionIds = collectProjectedReferencedSessionIds({
     database,
     excludedSessionKeys: changedSessionKeys,
     projectedStore: store,
     candidateSessionIds: uniqueStrings([
-      ...projectedRemovals.flatMap(({ expectedEntry }) =>
-        collectSessionStateIdsForEntry(expectedEntry),
+      ...projectedRemovals.flatMap((removal) =>
+        removal.kind === "retained" ? [] : collectSessionStateIdsForEntry(removal.expectedEntry),
       ),
       ...removedGenerationIds,
     ]),
   });
-  const deletePlans = projectedRemovals.flatMap(({ archiveTranscript, expectedEntry: entry }) =>
-    planSessionStateAfterEntryRemoval({
-      archiveDirectory,
-      archiveTranscript,
-      database,
-      entry,
-      reason: "deleted",
-      referencedSessionIds,
-    }),
+  // Retained owners have no entry references; every owned window survives their key transfer.
+  for (const sessionId of retainedSessionIds) {
+    referencedSessionIds.add(sessionId);
+  }
+  const deletePlans = projectedRemovals.flatMap((removal) =>
+    removal.kind === "retained"
+      ? []
+      : planSessionStateAfterEntryRemoval({
+          archiveDirectory,
+          archiveTranscript: removal.archiveTranscript,
+          database,
+          entry: removal.expectedEntry,
+          reason: "deleted",
+          referencedSessionIds,
+        }),
   );
   const observedSnapshotsBySessionId = new Map(
     projectedRemovals.flatMap(({ expectedEntry, removal }) =>
-      expectedEntry.sessionId && removal.expectedTranscriptSnapshot
+      expectedEntry?.sessionId && removal.expectedTranscriptSnapshot
         ? [[expectedEntry.sessionId, removal.expectedTranscriptSnapshot] as const]
         : [],
     ),

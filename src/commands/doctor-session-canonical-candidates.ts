@@ -6,6 +6,7 @@ import {
   listCanonicalSessionRepairFacts,
   type CanonicalSessionRepairFact,
 } from "../config/sessions/session-accessor.js";
+import { preserveCreationStamp } from "../config/sessions/session-entry-provenance.js";
 import { resolveDeliveryProvenCanonicalSessionKey } from "../config/sessions/store-entry.js";
 import { resolveAllAgentSessionStoreTargetsSync } from "../config/sessions/targets.js";
 import type { SessionEntry } from "../config/sessions/types.js";
@@ -27,24 +28,37 @@ import {
 } from "../routing/session-key.js";
 import { applyCanonicalOwnerEvidence } from "./doctor-session-canonical-owner-evidence.js";
 
-export type CanonicalSessionCandidate = {
+type CanonicalSessionCandidateLocation = {
   agentId: string;
   canonicalKey: string;
-  entry: SessionEntry;
-  expectedEntry: SessionEntry;
   ownerEvidenceOnly: boolean;
   sessionKey: string;
   sqlitePath: string;
   storePath: string;
-} & (
-  | { rawEntryJson: string; rawSnapshotRevision: number }
-  | { rawEntryJson?: never; rawSnapshotRevision?: never }
-);
+};
 
-export type CanonicalSessionCandidateFact = Omit<
-  CanonicalSessionCandidate,
-  "entry" | "expectedEntry" | "rawEntryJson" | "rawSnapshotRevision"
-> & {
+export type CanonicalSessionCandidate = CanonicalSessionCandidateLocation & {
+  inventoryFact: CanonicalSessionRepairFact;
+} & (
+    | ({
+        kind: "session";
+        entry: SessionEntry;
+        expectedEntry: SessionEntry;
+      } & (
+        | { rawEntryJson: string; rawSnapshotRevision: number }
+        | { rawEntryJson?: never; rawSnapshotRevision?: never }
+      ))
+    | {
+        kind: "retained";
+        sessionId: string;
+        updatedAt: number;
+        rawEntryJson: "{}";
+        rawSnapshotRevision: number;
+      }
+  );
+
+export type CanonicalSessionCandidateFact = CanonicalSessionCandidateLocation & {
+  kind: CanonicalSessionRepairFact["kind"];
   inventoryFact: CanonicalSessionRepairFact;
   lineageRepairRequired: boolean;
   normalizedForkSourceSessionKey?: string;
@@ -139,6 +153,7 @@ function collectCanonicalSessionCandidateFacts(
         {
           agentId: target.agentId,
           canonicalKey,
+          kind: inventoryFact.kind,
           inventoryFact,
           lineageRepairRequired:
             parentSessionKey !== inventoryFact.parentSessionKey ||
@@ -207,8 +222,8 @@ function groupRepairCandidates(
       group.length > 1 ||
       group.some(
         (candidate) =>
-          candidate.inventoryFact.rawCompareRequired ||
-          candidate.lineageRepairRequired ||
+          (candidate.kind === "session" &&
+            (candidate.inventoryFact.rawCompareRequired || candidate.lineageRepairRequired)) ||
           candidate.sessionKey !== candidate.canonicalKey ||
           candidate.sqlitePath !== destination.sqlitePath,
       );
@@ -229,4 +244,104 @@ export function collectCanonicalSessionRepairGroups(
   stores: readonly ExistingAgentDatabaseTarget[],
 ): CanonicalSessionRepairGroup[] {
   return groupRepairCandidates(collectCanonicalSessionCandidateFacts(params, stores), params);
+}
+
+function mergeCanonicalSessionEntryCandidates<T>(
+  candidates: readonly { entry: SessionEntry; preferred?: boolean; value: T }[],
+): { entry: SessionEntry; winner: T } | undefined {
+  let selected: { entry: SessionEntry; preferred: boolean; winner: T } | undefined;
+  for (const candidate of candidates) {
+    const incomingUpdatedAt =
+      typeof candidate.entry.updatedAt === "number" && Number.isFinite(candidate.entry.updatedAt)
+        ? candidate.entry.updatedAt
+        : 0;
+    const selectedUpdatedAt =
+      typeof selected?.entry.updatedAt === "number" && Number.isFinite(selected.entry.updatedAt)
+        ? selected.entry.updatedAt
+        : 0;
+    if (
+      !selected ||
+      incomingUpdatedAt > selectedUpdatedAt ||
+      (incomingUpdatedAt === selectedUpdatedAt &&
+        (candidate.preferred === true
+          ? !selected.preferred
+          : !selected.preferred &&
+            Buffer.compare(
+              Buffer.from(JSON.stringify(candidate.entry), "utf8"),
+              Buffer.from(JSON.stringify(selected.entry), "utf8"),
+            ) > 0))
+    ) {
+      selected = {
+        entry: structuredClone(candidate.entry),
+        preferred: candidate.preferred === true,
+        winner: candidate.value,
+      };
+    }
+  }
+  return selected;
+}
+
+export function selectCanonicalSessionCandidate(
+  candidates: readonly CanonicalSessionCandidate[],
+  params: { cfg: OpenClawConfig; env: NodeJS.ProcessEnv },
+) {
+  const first = candidates[0];
+  if (!first) {
+    return undefined;
+  }
+  const destination = resolveCanonicalSessionDestination({
+    canonicalKey: first.canonicalKey,
+    cfg: params.cfg,
+    env: params.env,
+    sourceAgentId: first.agentId,
+  });
+  const rankedCandidates = candidates
+    .filter((candidate) => candidate.kind === "session")
+    .toSorted((left, right) =>
+      Buffer.compare(
+        Buffer.from(`${left.sqlitePath}\0${left.sessionKey}`, "utf8"),
+        Buffer.from(`${right.sqlitePath}\0${right.sessionKey}`, "utf8"),
+      ),
+    )
+    .map((candidate) => ({
+      entry: candidate.entry,
+      preferred:
+        candidate.sqlitePath === destination.sqlitePath &&
+        candidate.sessionKey === candidate.canonicalKey,
+      value: candidate,
+    }));
+  const metadataCandidates = rankedCandidates.filter(({ value }) => !value.ownerEvidenceOnly);
+  const selected = mergeCanonicalSessionEntryCandidates(
+    metadataCandidates.length > 0 ? metadataCandidates : rankedCandidates,
+  );
+  if (!selected) {
+    const retained = candidates.filter((candidate) => candidate.kind === "retained");
+    const winner =
+      retained.find(
+        (candidate) =>
+          candidate.sqlitePath === destination.sqlitePath &&
+          candidate.sessionKey === candidate.canonicalKey,
+      ) ??
+      retained.toSorted(
+        (left, right) =>
+          right.updatedAt - left.updatedAt ||
+          Buffer.compare(
+            Buffer.from(`${left.sqlitePath}\0${left.sessionKey}`),
+            Buffer.from(`${right.sqlitePath}\0${right.sessionKey}`),
+          ),
+      )[0];
+    return winner ? { kind: "retained" as const, winner, destination } : undefined;
+  }
+  // Metadata follows recency, but an existing canonical isolation identity wins
+  // even over a newer required alias. Otherwise retain the newest required alias.
+  const requiredCandidates = rankedCandidates.filter(({ entry }) => entry.sandbox === "required");
+  const authoritativeStamp =
+    requiredCandidates.find(({ preferred }) => preferred)?.entry ??
+    mergeCanonicalSessionEntryCandidates(requiredCandidates)?.entry;
+  return {
+    kind: "session" as const,
+    ...selected,
+    entry: preserveCreationStamp(selected.entry, authoritativeStamp),
+    destination,
+  };
 }

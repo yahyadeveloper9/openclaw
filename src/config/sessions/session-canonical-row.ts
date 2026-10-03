@@ -57,6 +57,17 @@ export function validateCanonicalSessionRowEntry(
   entry: SessionEntry | null,
   mode: "admission" | "read" = "admission",
 ): SessionEntry | undefined {
+  const trimmed = row.session_key.trim();
+  const parsed = parseAgentSessionKey(trimmed);
+  if (
+    row.session_key !== trimmed ||
+    normalizeStoreSessionKey(trimmed) !== trimmed ||
+    (!parsed && trimmed !== "global" && trimmed !== "unknown")
+  ) {
+    throw canonicalSessionKeyMigrationRequiredError(
+      `non-canonical persisted row resolves to session key ${trimmed || row.session_key}`,
+    );
+  }
   if (
     row.entry_json === "{}" &&
     row.entry_valid === -1 &&
@@ -84,17 +95,6 @@ export function validateCanonicalSessionRowEntry(
   if (deliveryCanonicalKey !== row.session_key) {
     throw canonicalSessionKeyMigrationRequiredError(
       `non-canonical persisted row resolves to session key ${deliveryCanonicalKey}`,
-    );
-  }
-  const trimmed = row.session_key.trim();
-  const parsed = parseAgentSessionKey(trimmed);
-  if (
-    row.session_key !== trimmed ||
-    normalizeStoreSessionKey(trimmed) !== trimmed ||
-    (!parsed && trimmed !== "global" && trimmed !== "unknown")
-  ) {
-    throw canonicalSessionKeyMigrationRequiredError(
-      `non-canonical persisted row resolves to session key ${trimmed || row.session_key}`,
     );
   }
   for (const lineageKey of [row.parent_session_key, row.spawned_by, row.fork_source_session_key]) {

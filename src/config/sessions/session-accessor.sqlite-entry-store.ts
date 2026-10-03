@@ -198,12 +198,15 @@ export function deleteSessionEntryRows(
   options: {
     deleteOwnedWindows?: boolean;
     deliveryCleanupKeys?: readonly string[];
-    validatedEntry?: SessionEntry;
+    /** Null records a transaction-validated retained node with no live session entry. */
+    validatedEntry?: SessionEntry | null;
   } = {},
 ): void {
   // Doctor supplies the exact row it validated; the runtime parser deliberately rejects that shape.
   const previousEntry =
-    options.validatedEntry ?? readExactSessionEntryRow(database, sessionKey)?.entry;
+    options.validatedEntry !== undefined
+      ? options.validatedEntry
+      : readExactSessionEntryRow(database, sessionKey)?.entry;
   if (previousEntry) {
     commitSqliteSessionDeletion(sessionKey, previousEntry);
   }
@@ -212,6 +215,9 @@ export function deleteSessionEntryRows(
     database.db,
     db.selectFrom("session_windows").select("session_id").where("session_key", "=", sessionKey),
   ).rows;
+  if (options.validatedEntry === null && !options.deleteOwnedWindows && windows.length > 0) {
+    throw new Error(`SQLite retained session windows remain before removal for ${sessionKey}`);
+  }
   // Skip the survivor scan when maintenance reclaimed every window. Otherwise, project
   // reference metadata before acquiring rows to avoid loading unrelated saved prompts.
   const survivingNodes =
@@ -387,9 +393,7 @@ export function rehomeSessionWindows(
   canonicalKey: string,
   previousKeys: Iterable<string>,
 ): void {
-  const legacyKeys = uniqueStrings([...previousKeys].map((key) => key.trim())).filter(
-    (key) => key && key !== canonicalKey,
-  );
+  const legacyKeys = uniqueStrings(previousKeys).filter((key) => key && key !== canonicalKey);
   if (legacyKeys.length === 0) {
     return;
   }

@@ -191,11 +191,12 @@ export function prepareLifecycleIdentityPublication(params: {
   removedSessionKeys: readonly string[];
 }): () => void {
   const removedKeys = new Set(params.removedSessionKeys);
-  const previous = new Map(
-    params.projected.removals
-      .filter((removal) => removedKeys.has(removal.sessionKey))
-      .map((removal) => [removal.sessionKey, removal.expectedEntry]),
-  );
+  const previous = new Map<string, SessionEntry>();
+  for (const removal of params.projected.removals) {
+    if (removal.kind !== "retained" && removedKeys.has(removal.sessionKey)) {
+      previous.set(removal.sessionKey, removal.expectedEntry);
+    }
+  }
   const current = new Map<string, SessionEntry>();
   for (const upsert of params.projected.upsertedEntries) {
     if (!current.has(upsert.sessionKey) && upsert.expectedEntry) {

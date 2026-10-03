@@ -303,7 +303,10 @@ export async function noteSessionTranscriptHealth(options?: {
       cfg: params.cfg ?? {},
       env: params.env,
     };
-    canonicalKeyReport = await repairCanonicalSessionKeys(repairParams);
+    canonicalKeyReport = await repairCanonicalSessionKeys({
+      ...repairParams,
+      authority: maintenanceAuthority,
+    });
     // Preview reuses its read-only inventory; import and key repair can create stores.
     const rowRepairParams = {
       ...repairParams,

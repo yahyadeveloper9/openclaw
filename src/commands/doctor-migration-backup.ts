@@ -63,7 +63,7 @@ export async function backupDoctorSqliteDatabases(params: {
   pendingDatabasePaths: readonly string[];
   databasePaths: readonly string[];
   authority: DoctorSqliteMaintenanceAuthority;
-  repair?: { key: string; validate: (database: DatabaseSync) => void };
+  repair?: { key: string; validate: (database: DatabaseSync, sourcePath: string) => void };
   verifiedSnapshots?: readonly BackupSqliteSnapshotFact[];
 }): Promise<MigrationMessages> {
   const pending = new Set(params.pendingDatabasePaths);
@@ -99,6 +99,7 @@ export async function backupDoctorSqliteDatabases(params: {
     ),
   ];
   if (
+    !params.repair &&
     sources.length > 0 &&
     sources.every((sourcePath) => {
       const { dev, ino } = statSync(sourcePath);
@@ -227,7 +228,7 @@ export async function backupDoctorSqliteDatabases(params: {
           await loadSqliteVecExtension({ db: snapshot });
           assertCapture();
           assertSqliteIntegrity(snapshot, targetPath);
-          params.repair?.validate(snapshot);
+          params.repair?.validate(snapshot, sourcePath);
         } finally {
           snapshot.close();
         }
@@ -256,7 +257,9 @@ export async function backupDoctorSqliteDatabases(params: {
       preserveRowIds: true,
       transform: sanitizeOpenClawStateLeaseRows,
       beforePublish: assertCapture,
-      validate: params.repair?.validate,
+      validate: params.repair
+        ? (database) => params.repair?.validate(database, sourcePath)
+        : undefined,
     });
     assertCapture();
     changes.push(`Saved pre-migration SQLite backup: ${backup.path}`);

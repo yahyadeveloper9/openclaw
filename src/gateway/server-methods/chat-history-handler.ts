@@ -18,7 +18,6 @@ import {
   measureDiagnosticsTimelineSpanSync,
 } from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage } from "../../infra/errors.js";
-import { scopeLegacySessionKeyToAgent } from "../../routing/session-key.js";
 import { resolveInFlightRunSnapshot } from "../chat-abort.js";
 import { resolveEffectiveChatHistoryMaxChars } from "../chat-display-projection.js";
 import { isQueuedChatTurnForSession } from "../chat-queued-turns.js";
@@ -141,13 +140,7 @@ export async function handleChatHistoryRequest({
         },
         signal,
       );
-      return Boolean(
-        transcript &&
-        scopeLegacySessionKeyToAgent({
-          sessionKey: transcript.sessionKey,
-          agentId: sessionAgentId,
-        }) === scopeLegacySessionKeyToAgent({ sessionKey: canonicalKey, agentId: sessionAgentId }),
-      );
+      return transcript?.sessionKey === canonicalKey;
     };
     if (!(await readTranscriptOwner())) {
       if (retainedTranscript) {

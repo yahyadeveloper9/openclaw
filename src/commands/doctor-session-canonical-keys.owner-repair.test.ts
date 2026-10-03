@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
@@ -5,9 +6,12 @@ import {
   assignSessionOwner,
   loadExactSessionEntryReadOnly,
   loadTranscriptEvents,
+  replaceSessionEntrySync,
 } from "../config/sessions/session-accessor.js";
+import { scanCanonicalSqliteSessionEntries } from "../config/sessions/session-canonical-key.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { openNodeSqliteDatabase, resolveImmutableSqliteFileUri } from "../infra/node-sqlite.js";
 import { FIRST_USE_ADDITIVE_AGENT_COLUMN_DEFINITIONS } from "../state/openclaw-agent-db-additive-columns.js";
 import {
   closeOpenClawAgentDatabasesForTest,
@@ -17,6 +21,7 @@ import { withStateDirEnv } from "../test-helpers/state-dir-env.js";
 import { normalizeSessionDeliveryState } from "../utils/delivery-context.shared.js";
 import { repairCanonicalSessionKeys } from "./doctor-session-canonical-keys.js";
 import { insertLegacySession } from "./doctor-session-canonical-keys.test-support.js";
+import { withDoctorSqliteMaintenanceLock } from "./doctor-sqlite-maintenance-lock.js";
 
 afterEach(() => closeOpenClawAgentDatabasesForTest());
 
@@ -45,6 +50,308 @@ function insertEmptyAlias(params: {
 }
 
 describe("doctor transcript owner repair", () => {
+  it("canonicalizes retained placeholders without reviving entries or replacing a live owner", async () => {
+    await withStateDirEnv("openclaw-doctor-retained-keys-", async ({ stateDir }) => {
+      const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+      const storePath = resolveSessionStorePathCore(undefined, { agentId: "main", env });
+      const cfg: OpenClawConfig = {
+        agents: { ownership: "explicit", entries: { main: {} } },
+      };
+      const retained = [
+        { sourceKey: "retained", canonicalKey: "agent:main:retained", sessionId: "old-retained" },
+        { sourceKey: " live ", canonicalKey: "agent:main:live", sessionId: "old-live" },
+      ];
+      replaceSessionEntrySync(
+        { agentId: "main", env, storePath, sessionKey: "agent:main:live" },
+        { sessionId: "current-live", updatedAt: 100, label: "Current metadata" },
+      );
+      replaceSessionEntrySync(
+        { agentId: "main", env, storePath, sessionKey: "agent:main:keeper" },
+        { sessionId: "keeper", previousSessionId: "older-live", updatedAt: 100 },
+      );
+      const database = openOpenClawAgentDatabase({
+        agentId: "main",
+        env,
+        path: resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main", env }).path,
+      });
+      insertLegacySession({
+        agentId: "main",
+        env,
+        storePath,
+        sessionKey: "live",
+        entry: { sessionId: "older-live", updatedAt: 10 },
+        eventText: "retained by a surviving session",
+      });
+      database.db
+        .prepare("UPDATE session_nodes SET entry_valid = 1 WHERE session_key = 'live'")
+        .run();
+      for (const { sourceKey, sessionId } of retained) {
+        insertLegacySession({
+          agentId: "main",
+          env,
+          storePath,
+          sessionKey: sourceKey,
+          entry: { sessionId, updatedAt: 20 },
+          eventText: "retained history 雪🦞",
+        });
+        database.db
+          .prepare("UPDATE session_nodes SET entry_json = '{}', label = ? WHERE session_key = ?")
+          .run(`Retained ${sessionId}`, sourceKey);
+        database.db
+          .prepare("UPDATE session_nodes SET entry_valid = -1 WHERE session_key = ?")
+          .run(sourceKey);
+      }
+      database.db
+        .prepare(
+          "INSERT INTO session_entry_snapshots (session_key, field, value_json) VALUES (?, ?, ?)",
+        )
+        .run("retained", "skillsSnapshot", '{"retained":"opaque original"}');
+      database.db
+        .prepare("UPDATE session_nodes SET entry_valid = -1 WHERE session_key = 'retained'")
+        .run();
+      const eventsBefore = database.db
+        .prepare("SELECT * FROM transcript_events ORDER BY session_id, seq")
+        .all();
+      const windowsBefore = database.db
+        .prepare("SELECT * FROM session_windows ORDER BY session_id")
+        .all();
+      const liveBefore = database.db
+        .prepare(
+          "SELECT entry_json, current_session_id, updated_at, label FROM session_nodes WHERE session_key = ?",
+        )
+        .get("agent:main:live");
+      expect(() => scanCanonicalSqliteSessionEntries(database)).toThrow(
+        "run openclaw doctor --fix",
+      );
+      expect(await repairCanonicalSessionKeys({ apply: false, cfg, env })).toMatchObject({
+        foundGroups: 2,
+        repairedGroups: 0,
+      });
+      const repair = () =>
+        withDoctorSqliteMaintenanceLock({
+          env,
+          operation: "test retained transcript repair",
+          protectedPaths: [database.path],
+          run: (authority) => repairCanonicalSessionKeys({ apply: true, authority, cfg, env }),
+        });
+      expect(await repair()).toMatchObject({ foundGroups: 2, repairedGroups: 2 });
+      expect(
+        database.db.prepare("SELECT * FROM transcript_events ORDER BY session_id, seq").all(),
+      ).toEqual(eventsBefore);
+      expect(
+        database.db.prepare("SELECT * FROM session_windows ORDER BY session_id").all(),
+      ).toEqual(
+        windowsBefore.map((window) => ({
+          ...window,
+          session_key:
+            retained.find((source) => source.sourceKey === window.session_key)?.canonicalKey ??
+            (window.session_key === "live" ? "agent:main:live" : window.session_key),
+        })),
+      );
+      expect(
+        database.db
+          .prepare(
+            "SELECT entry_json, current_session_id, updated_at, label FROM session_nodes WHERE session_key = ?",
+          )
+          .get("agent:main:live"),
+      ).toEqual(liveBefore);
+      expect(
+        database.db
+          .prepare(
+            "SELECT entry_json, entry_valid, current_session_id, label FROM session_nodes WHERE session_key = ?",
+          )
+          .get("agent:main:retained"),
+      ).toEqual({
+        entry_json: "{}",
+        entry_valid: -1,
+        current_session_id: "old-retained",
+        label: "Retained old-retained",
+      });
+      for (const sourceKey of [...retained.map((source) => source.sourceKey), "live"]) {
+        expect(
+          database.db
+            .prepare("SELECT session_key FROM session_nodes WHERE session_key = ?")
+            .get(sourceKey),
+        ).toBeUndefined();
+      }
+      expect(
+        database.db
+          .prepare("SELECT value_json FROM session_entry_snapshots WHERE session_key = ?")
+          .get("agent:main:retained"),
+      ).toEqual({ value_json: '{"retained":"opaque original"}' });
+      expect(() => scanCanonicalSqliteSessionEntries(database)).not.toThrow();
+      expect(await repair()).toMatchObject({ foundGroups: 0, repairedGroups: 0 });
+      const backupName = fs
+        .readdirSync(path.dirname(database.path))
+        .find(
+          (name) =>
+            name.startsWith(`${path.basename(database.path)}.pre-startup-migration-`) &&
+            name.endsWith(".bak"),
+        );
+      expect(backupName).toBeDefined();
+      const backup = openNodeSqliteDatabase(
+        resolveImmutableSqliteFileUri(path.join(path.dirname(database.path), backupName!)),
+        { readOnly: true },
+      );
+      try {
+        expect(
+          backup.prepare("SELECT * FROM transcript_events ORDER BY session_id, seq").all(),
+        ).toEqual(eventsBefore);
+        expect(backup.prepare("SELECT * FROM session_windows ORDER BY session_id").all()).toEqual(
+          windowsBefore,
+        );
+        expect(
+          backup
+            .prepare("SELECT entry_json FROM session_nodes WHERE session_key = ?")
+            .get(" live "),
+        ).toEqual({ entry_json: "{}" });
+      } finally {
+        backup.close();
+      }
+    });
+  });
+
+  it("moves a qualified retained owner from the wrong store without reviving it", async () => {
+    await withStateDirEnv("openclaw-doctor-retained-store-", async ({ stateDir }) => {
+      const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+      const sourcePath = resolveSessionStorePathCore(undefined, { agentId: "main", env });
+      const destinationPath = resolveSessionStorePathCore(undefined, { agentId: "ops", env });
+      const sessionKey = "agent:ops:retained";
+      const sessionId = "retained-cross-store";
+      const cfg: OpenClawConfig = {
+        agents: { ownership: "explicit", entries: { main: {}, ops: {} } },
+      };
+      insertLegacySession({
+        agentId: "main",
+        env,
+        storePath: sourcePath,
+        sessionKey,
+        entry: { sessionId, updatedAt: 12 },
+        eventText: "preserved cross-store history",
+      });
+      const source = openOpenClawAgentDatabase({
+        agentId: "main",
+        env,
+        path: resolveSqliteTargetFromSessionStorePath(sourcePath, { agentId: "main", env }).path,
+      });
+      source.db
+        .prepare("UPDATE session_nodes SET entry_json = '{}' WHERE session_key = ?")
+        .run(sessionKey);
+      source.db
+        .prepare("UPDATE session_nodes SET entry_valid = -1 WHERE session_key = ?")
+        .run(sessionKey);
+      const original = source.db
+        .prepare("SELECT * FROM transcript_events WHERE session_id = ? ORDER BY seq")
+        .all(sessionId);
+      const repair = () =>
+        withDoctorSqliteMaintenanceLock({
+          env,
+          operation: "test retained cross-store repair",
+          run: (authority) => repairCanonicalSessionKeys({ apply: true, authority, cfg, env }),
+        });
+      expect(await repair()).toMatchObject({ foundGroups: 1, repairedGroups: 1 });
+      const destination = openOpenClawAgentDatabase({
+        agentId: "ops",
+        env,
+        path: resolveSqliteTargetFromSessionStorePath(destinationPath, { agentId: "ops", env })
+          .path,
+      });
+      expect(
+        destination.db
+          .prepare("SELECT * FROM transcript_events WHERE session_id = ? ORDER BY seq")
+          .all(sessionId),
+      ).toEqual(original);
+      expect(
+        destination.db
+          .prepare(
+            "SELECT entry_json, entry_valid, current_session_id FROM session_nodes WHERE session_key = ?",
+          )
+          .get(sessionKey),
+      ).toEqual({ entry_json: "{}", entry_valid: -1, current_session_id: sessionId });
+      expect(
+        destination.db
+          .prepare("SELECT session_key FROM session_windows WHERE session_id = ?")
+          .get(sessionId),
+      ).toEqual({ session_key: sessionKey });
+      expect(
+        source.db
+          .prepare("SELECT session_key FROM session_nodes WHERE session_key = ?")
+          .get(sessionKey),
+      ).toBeUndefined();
+      expect(
+        source.db
+          .prepare("SELECT session_id FROM session_windows WHERE session_id = ?")
+          .get(sessionId),
+      ).toBeUndefined();
+      expect(() => scanCanonicalSqliteSessionEntries(destination)).not.toThrow();
+      expect(await repair()).toMatchObject({ foundGroups: 0, repairedGroups: 0 });
+    });
+  });
+
+  it("preserves both retained owners when saved snapshots conflict", async () => {
+    await withStateDirEnv("openclaw-doctor-retained-key-conflict-", async ({ stateDir }) => {
+      const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+      const storePath = resolveSessionStorePathCore(undefined, { agentId: "main", env });
+      const cfg: OpenClawConfig = { agents: { ownership: "explicit", entries: { main: {} } } };
+      for (const [sessionKey, sessionId] of [
+        ["history", "retained"],
+        ["agent:main:history", "current"],
+      ]) {
+        insertLegacySession({
+          agentId: "main",
+          env,
+          storePath,
+          sessionKey,
+          entry: { sessionId, updatedAt: 1 },
+          eventText: sessionId,
+        });
+      }
+      const database = openOpenClawAgentDatabase({
+        agentId: "main",
+        env,
+        path: resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main", env }).path,
+      });
+      database.db
+        .prepare("UPDATE session_nodes SET entry_json = '{}' WHERE session_key = 'history'")
+        .run();
+      database.db
+        .prepare("UPDATE session_nodes SET entry_valid = -1 WHERE session_key = 'history'")
+        .run();
+      database.db
+        .prepare(
+          "INSERT INTO session_entry_snapshots (session_key, field, value_json) VALUES (?, 'skillsSnapshot', ?)",
+        )
+        .run("history", '{"source":"retained"}');
+      database.db
+        .prepare(
+          "INSERT INTO session_entry_snapshots (session_key, field, value_json) VALUES (?, 'skillsSnapshot', ?)",
+        )
+        .run("agent:main:history", '{"source":"current"}');
+      database.db
+        .prepare("UPDATE session_nodes SET entry_valid = -1 WHERE session_key = 'history'")
+        .run();
+      const nodes = database.db.prepare("SELECT * FROM session_nodes ORDER BY session_key").all();
+      const windows = database.db
+        .prepare("SELECT * FROM session_windows ORDER BY session_id")
+        .all();
+      const events = database.db
+        .prepare("SELECT * FROM transcript_events ORDER BY session_id, seq")
+        .all();
+      await expect(repairCanonicalSessionKeys({ apply: true, cfg, env })).rejects.toThrow(
+        "conflicts with agent:main:history in skillsSnapshot",
+      );
+      expect(database.db.prepare("SELECT * FROM session_nodes ORDER BY session_key").all()).toEqual(
+        nodes,
+      );
+      expect(
+        database.db.prepare("SELECT * FROM session_windows ORDER BY session_id").all(),
+      ).toEqual(windows);
+      expect(
+        database.db.prepare("SELECT * FROM transcript_events ORDER BY session_id, seq").all(),
+      ).toEqual(events);
+    });
+  });
+
   it.each([
     { sourceAgentId: "main", requiredAlias: true, requiredCanonical: false },
     { sourceAgentId: "ops", requiredAlias: true, requiredCanonical: false },

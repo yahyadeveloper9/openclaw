@@ -111,6 +111,7 @@ export function copySqliteSessionOwnedStateForCanonicalRepair(params: {
   destinationDatabase: OpenClawAgentDatabase;
   preferredEntry?: SessionEntry;
   preferredSessionKey?: string;
+  preserveDestinationMembership?: boolean;
   source: { agentId: string; storePath: string };
   sourceEntries: readonly SessionEntry[];
   sourceKeys: readonly string[];
@@ -127,6 +128,7 @@ export function copySqliteSessionOwnedStateForCanonicalRepair(params: {
         destination: params.destinationDatabase,
         ...(params.preferredEntry ? { preferredEntry: params.preferredEntry } : {}),
         ...(params.preferredSessionKey ? { preferredSessionKey: params.preferredSessionKey } : {}),
+        preserveDestinationMembership: params.preserveDestinationMembership,
         source: sourceDatabase,
         sourceEntries: params.sourceEntries,
         sourceKeys: params.sourceKeys,
@@ -282,6 +284,7 @@ function copySqliteSessionOwnedStateForRepair(params: {
   destination: OpenClawAgentDatabase;
   preferredEntry?: SessionEntry;
   preferredSessionKey?: string;
+  preserveDestinationMembership?: boolean;
   source: OpenClawAgentDatabase;
   sourceEntries: readonly SessionEntry[];
   sourceKeys: readonly string[];
@@ -510,7 +513,9 @@ function copySqliteSessionOwnedStateForRepair(params: {
   }
   // Membership is authorization state and follows the selected winner. Boards,
   // suggestions, and heartbeat state merge by their own revision/id contracts.
-  deleteSessionMembersForRepair(params.destination, params.canonicalKey);
+  if (!params.preserveDestinationMembership) {
+    deleteSessionMembersForRepair(params.destination, params.canonicalKey);
+  }
   copySessionNodeArtifactsForRepair(
     params.source,
     params.destination,
@@ -523,6 +528,6 @@ function copySqliteSessionOwnedStateForRepair(params: {
     params.destination,
     params.preferredSessionKey ? [params.preferredSessionKey] : sourceKeys,
     params.canonicalKey,
-    { includeParticipants: false },
+    { includeParticipants: false, includeMembers: !params.preserveDestinationMembership },
   );
 }

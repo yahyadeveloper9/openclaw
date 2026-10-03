@@ -144,20 +144,35 @@ type SessionEntryLifecycleRemovalBase = {
   expectedUpdatedAt?: number;
 };
 
-export type SessionEntryLifecycleRemoval = SessionEntryLifecycleRemovalBase &
-  (
-    | {
-        /** Doctor repair only: compare the rejected hot blob and its detached snapshot revision. */
-        expectedRawEntryJson: string;
-        expectedSnapshotRevision: number;
-        expectedEntry: SessionEntry;
-      }
-    | {
-        expectedRawEntryJson?: never;
-        expectedSnapshotRevision?: never;
-        expectedEntry?: SessionEntry;
-      }
-  );
+export type SessionEntryLifecycleRemoval =
+  | (SessionEntryLifecycleRemovalBase & { kind?: "session" } & (
+        | {
+            /** Doctor repair only: compare the rejected hot blob and its detached snapshot revision. */
+            expectedRawEntryJson: string;
+            expectedSnapshotRevision: number;
+            expectedEntry: SessionEntry;
+          }
+        | {
+            expectedRawEntryJson?: never;
+            expectedSnapshotRevision?: never;
+            expectedEntry?: SessionEntry;
+          }
+      ))
+  | (Pick<
+      SessionEntryLifecycleRemovalBase,
+      "sessionKey" | "exactStoredKey" | "deleteOwnedWindows" | "deliveryCleanupKeys"
+    > & {
+      /** Doctor transfers this retained node's windows without deleting a live session. */
+      kind: "retained";
+      expectedRawEntryJson: "{}";
+      expectedSnapshotRevision: number;
+      expectedSessionId: string;
+      expectedUpdatedAt: number;
+      expectedEntry?: never;
+      expectedLifecycleRevision?: never;
+      expectedTranscriptSnapshot?: never;
+      archiveRemovedTranscript?: never;
+    });
 
 export class SessionEntryLifecycleUpsertConflictError extends Error {
   constructor(readonly sessionKey: string) {

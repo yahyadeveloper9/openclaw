@@ -389,12 +389,22 @@ export type LifecycleArtifactCleanupWorkerResult = {
 export type ProjectedLifecycleMutation = {
   archiveRecovery?: { pending: boolean; databaseIdentity: string };
   deletePlans: SessionStateDeletePlan[];
-  removals: Array<{
-    archiveTranscript: boolean;
-    expectedEntry: SessionEntry;
-    removal: SessionEntryLifecycleRemoval;
-    sessionKey: string;
-  }>;
+  removals: Array<
+    | {
+        kind?: "session";
+        archiveTranscript: boolean;
+        expectedEntry: SessionEntry;
+        removal: Exclude<SessionEntryLifecycleRemoval, { kind: "retained" }>;
+        sessionKey: string;
+      }
+    | {
+        kind: "retained";
+        archiveTranscript: false;
+        expectedEntry: null;
+        removal: Extract<SessionEntryLifecycleRemoval, { kind: "retained" }>;
+        sessionKey: string;
+      }
+  >;
   upsertedEntries: Array<{
     entry: SessionEntry;
     expectedEntry: SessionEntry | undefined;

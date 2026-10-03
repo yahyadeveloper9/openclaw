@@ -14,7 +14,9 @@ export function prepareReclamationPublication(
     return prepareCommittedSessionEntryRemovals(
       plan.agentId,
       databaseIdentity,
-      plan.input.projected.removals.filter(({ sessionKey }) => removed.has(sessionKey)),
+      plan.input.projected.removals.flatMap((removal) =>
+        removal.kind !== "retained" && removed.has(removal.sessionKey) ? [removal] : [],
+      ),
     );
   }
   if (plan.kind === "maintenance-finalize" && result?.kind === "maintenance-finalize") {

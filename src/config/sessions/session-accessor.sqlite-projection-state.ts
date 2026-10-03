@@ -15,6 +15,7 @@ import {
 import {
   assertRawSessionEntryRemovalUnchanged,
   deleteMaterializedSessionStatePlans,
+  readSessionGenerationIdsForKeys,
   shouldRemoveSessionEntry,
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import type {
@@ -41,7 +42,7 @@ type ProjectedLifecycleCommitOptions = Omit<ProjectedLifecycleRemovalCommitInput
 
 function readProjectedRemovalEntry(
   database: OpenClawAgentDatabase,
-  projected: ProjectedLifecycleMutation["removals"][number],
+  projected: Exclude<ProjectedLifecycleMutation["removals"][number], { kind: "retained" }>,
   allowCanonicalRepair = false,
 ): SessionEntry | undefined {
   if (projected.removal.expectedRawEntryJson === undefined) {
@@ -73,6 +74,10 @@ export function commitProjectedSessionEntryLifecycleMutationInDatabase(
   }
   const beforeCount = readSessionEntryCount(database);
   const validatedRemovals = projected.removals.filter((removal) => {
+    if (removal.kind === "retained") {
+      assertRawSessionEntryRemovalUnchanged(database, removal.sessionKey, removal.removal);
+      return true;
+    }
     if (materializationFailed && removal.removal.archiveRemovedTranscript === true) {
       return false;
     }
@@ -96,9 +101,17 @@ export function commitProjectedSessionEntryLifecycleMutationInDatabase(
     }
     return shouldRemove;
   });
+  const retainedKeys = validatedRemovals.flatMap((removal) =>
+    removal.kind === "retained" ? [removal.sessionKey] : [],
+  );
+  const retainedSessionIds = new Set(
+    retainedKeys.length > 0
+      ? readSessionGenerationIdsForKeys(database, retainedKeys, { exactStoredKeys: true })
+      : [],
+  );
   const archivedTranscripts = deleteMaterializedSessionStatePlans(
     database,
-    removalPlans,
+    removalPlans.filter((plan) => !retainedSessionIds.has(plan.sessionId)),
     undefined,
     new Set(validatedRemovals.map((removal) => removal.sessionKey)),
   );
@@ -115,21 +128,27 @@ export function commitProjectedSessionEntryLifecycleMutationInDatabase(
   } of projected.upsertedEntries) {
     const sameKeyRemoval = validatedRemovals.find((removal) => removal.sessionKey === sessionKey);
     const currentEntry = sameKeyRemoval
-      ? readProjectedRemovalEntry(database, sameKeyRemoval, options.allowCanonicalRepair)
+      ? sameKeyRemoval.kind === "retained"
+        ? undefined
+        : readProjectedRemovalEntry(database, sameKeyRemoval, options.allowCanonicalRepair)
       : (options.allowCanonicalRepair
           ? readExactSessionEntryRowForCanonicalRepair(database, sessionKey, {
               allowMalformedRowRepair: true,
             })
           : readExactSessionEntryRow(database, sessionKey)
         )?.entry;
-    const expectedCurrentEntry = expectedEntry ?? sameKeyRemoval?.expectedEntry;
+    const expectedCurrentEntry = expectedEntry ?? sameKeyRemoval?.expectedEntry ?? undefined;
     if (!sqliteSessionEntriesEqual(currentEntry, expectedCurrentEntry)) {
       if (sameKeyRemoval) {
         throw new Error(`SQLite session entry has stale lifecycle state for ${sessionKey}`);
       }
       throw new SessionEntryLifecycleUpsertConflictError(sessionKey);
     }
-    if (sameKeyRemoval && !shouldRemoveSessionEntry(currentEntry, sameKeyRemoval.removal)) {
+    if (
+      sameKeyRemoval &&
+      sameKeyRemoval.kind !== "retained" &&
+      !shouldRemoveSessionEntry(currentEntry, sameKeyRemoval.removal)
+    ) {
       throw new Error(`SQLite session entry has stale lifecycle state for ${sessionKey}`);
     }
     if (resetBoundary && expectedEntry?.sessionId) {
@@ -147,6 +166,9 @@ export function commitProjectedSessionEntryLifecycleMutationInDatabase(
       ...(routeContext !== undefined ? { routeContext } : {}),
     });
     const relatedRemovalKeys = validatedRemovals.flatMap((removal) => {
+      if (removal.kind === "retained") {
+        return [];
+      }
       const removedSessionId = removal.expectedEntry.sessionId;
       return removal.sessionKey !== sessionKey &&
         (removedSessionId === entry.sessionId || removedSessionId === entry.previousSessionId)
@@ -169,6 +191,19 @@ export function commitProjectedSessionEntryLifecycleMutationInDatabase(
   const upsertedKeys = new Set(projected.upsertedEntries.map((upsert) => upsert.sessionKey));
   for (const removal of validatedRemovals) {
     if (upsertedKeys.has(removal.sessionKey)) {
+      continue;
+    }
+    if (removal.kind === "retained") {
+      // Doctor has transferred the windows; the source node itself must remain unchanged.
+      assertRawSessionEntryRemovalUnchanged(database, removal.sessionKey, removal.removal, {
+        requireOwnedWindow: false,
+      });
+      deleteSessionEntryRows(database, removal.sessionKey, {
+        deleteOwnedWindows: removal.removal.deleteOwnedWindows === true,
+        deliveryCleanupKeys: removal.removal.deliveryCleanupKeys,
+        validatedEntry: null,
+      });
+      removedSessionKeys.push(removal.sessionKey);
       continue;
     }
     const entry = readProjectedRemovalEntry(database, removal, options.allowCanonicalRepair);

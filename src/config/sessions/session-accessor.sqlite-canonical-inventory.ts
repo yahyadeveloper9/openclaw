@@ -39,6 +39,7 @@ type CanonicalSessionDecision = {
 };
 
 export type CanonicalSessionRepairFact = CanonicalSessionDecision & {
+  kind: "session" | "retained";
   decisionToken: string;
   inventoryToken: string;
 };
@@ -48,6 +49,7 @@ type ScannedCanonicalSessionFact = {
   currentWindowOwnerSessionKey: string | null;
   decision: Omit<CanonicalSessionDecision, "canonicalOwnerSessionKey">;
   entryJsonIsEmpty: boolean;
+  entryValid: number;
   rowToken: string;
 };
 
@@ -61,11 +63,19 @@ type DoctorSessionEntrySummary = SessionEntrySummary & {
   recoveredFromProjections: boolean;
 };
 
-type CanonicalSessionRepairEntry = SessionEntrySummary &
-  (
-    | { rawEntryJson: string; rawSnapshotRevision: number }
-    | { rawEntryJson?: never; rawSnapshotRevision?: never }
-  );
+type CanonicalSessionRepairEntry =
+  | (SessionEntrySummary & { kind: "session" } & (
+        | { rawEntryJson: string; rawSnapshotRevision: number }
+        | { rawEntryJson?: never; rawSnapshotRevision?: never }
+      ))
+  | {
+      kind: "retained";
+      sessionKey: string;
+      sessionId: string;
+      updatedAt: number;
+      rawEntryJson: "{}";
+      rawSnapshotRevision: number;
+    };
 
 /** Doctor inventory hydrates rejected legacy blobs from promoted node/window columns. */
 function hydrateCanonicalRepairEntry(row: CanonicalRepairRow): SessionEntry {
@@ -187,13 +197,10 @@ function scanCanonicalSessionFactsFromDatabase(
 ): {
   facts: CanonicalSessionRepairFact[];
   inventoryToken: string;
-  loaded: Map<string, { entry: SessionEntry; rawEntryJson: string; rawSnapshotRevision: number }>;
+  loaded: Map<string, CanonicalRepairRow>;
 } {
   const scanned: ScannedCanonicalSessionFact[] = [];
-  const loaded = new Map<
-    string,
-    { entry: SessionEntry; rawEntryJson: string; rawSnapshotRevision: number }
-  >();
+  const loaded = new Map<string, CanonicalRepairRow>();
   const validSessionKeysById = new Map<string, string[]>();
   const inventoriedSessionKeys = new Set<string>();
   for (const row of iterateSqliteQuerySync(database.db, canonicalRepairQuery(database))) {
@@ -206,11 +213,7 @@ function scanCanonicalSessionFactsFromDatabase(
     }
     const entry = persistedEntry ?? hydrateCanonicalRepairEntry(row);
     if (selectedKeys?.has(row.session_key)) {
-      loaded.set(row.session_key, {
-        entry,
-        rawEntryJson: row.entry_json,
-        rawSnapshotRevision: row.snapshot_revision,
-      });
+      loaded.set(row.session_key, row);
     }
     const lineageProjectionMismatch = Boolean(
       persistedEntry &&
@@ -236,6 +239,7 @@ function scanCanonicalSessionFactsFromDatabase(
       currentWindowOwnerSessionKey: row.current_window_owner_session_key,
       decision,
       entryJsonIsEmpty: row.entry_json === "{}",
+      entryValid: row.entry_valid,
       rowToken: JSON.stringify([
         row.session_key,
         row.current_session_id,
@@ -277,11 +281,16 @@ function scanCanonicalSessionFactsFromDatabase(
           inventoriedSessionKeys.has(fact.currentWindowOwnerSessionKey)
         ? fact.currentWindowOwnerSessionKey
         : undefined;
-    const decisionToken = JSON.stringify([fact.rowToken, canonicalOwnerSessionKey ?? null]);
+    const kind =
+      isEmptyWindowOwner && fact.entryValid === -1 && competingValidKeys.length === 0
+        ? "retained"
+        : "session";
+    const decisionToken = JSON.stringify([fact.rowToken, canonicalOwnerSessionKey ?? null, kind]);
     inventoryHash.update(decisionToken).update("\0");
-    if (!isEmptyWindowOwner || canonicalOwnerSessionKey) {
+    if (!isEmptyWindowOwner || canonicalOwnerSessionKey || kind === "retained") {
       facts.push({
         ...fact.decision,
+        kind,
         ...(canonicalOwnerSessionKey ? { canonicalOwnerSessionKey } : {}),
         decisionToken,
       });
@@ -295,7 +304,7 @@ function scanCanonicalSessionFactsFromDatabase(
   };
 }
 
-function loadCanonicalRepairEntriesFromDatabase(
+export function loadCanonicalRepairEntriesFromDatabase(
   database: Pick<OpenClawAgentDatabase, "db">,
   facts: readonly CanonicalSessionRepairFact[],
 ): CanonicalSessionRepairEntry[] {
@@ -308,7 +317,7 @@ function loadCanonicalRepairEntriesFromDatabase(
   if (expectedInventoryTokens.size !== 1 || !expectedInventoryTokens.has(current.inventoryToken)) {
     throw new Error("Canonical session repair inputs changed during scan; retry Doctor");
   }
-  return facts.map((fact) => {
+  return facts.map((fact): CanonicalSessionRepairEntry => {
     if (currentByKey.get(fact.sessionKey)?.decisionToken !== fact.decisionToken) {
       throw new Error(
         `Canonical session repair inputs changed during scan for ${fact.sessionKey}; retry Doctor`,
@@ -318,15 +327,26 @@ function loadCanonicalRepairEntriesFromDatabase(
     if (!loaded) {
       throw new Error(`Canonical session repair row disappeared during scan: ${fact.sessionKey}`);
     }
+    if (fact.kind === "retained") {
+      return {
+        kind: "retained",
+        sessionKey: fact.sessionKey,
+        sessionId: loaded.current_session_id,
+        updatedAt: loaded.updated_at,
+        rawEntryJson: "{}",
+        rawSnapshotRevision: loaded.snapshot_revision,
+      };
+    }
     const summary = {
-      entry: loaded.entry,
+      kind: "session" as const,
+      entry: parseSessionEntryJson(loaded) ?? hydrateCanonicalRepairEntry(loaded),
       sessionKey: fact.sessionKey,
     };
     return fact.rawCompareRequired
       ? {
           ...summary,
-          rawEntryJson: loaded.rawEntryJson,
-          rawSnapshotRevision: loaded.rawSnapshotRevision,
+          rawEntryJson: loaded.entry_json,
+          rawSnapshotRevision: loaded.snapshot_revision,
         }
       : summary;
   });
@@ -389,7 +409,9 @@ export function scanDoctorSessionEntriesTolerant(
   const resolved = resolveSqliteScope({ ...scope, sessionKey: "" });
   const result = withOpenClawAgentDatabaseReadOnly((database) => {
     const eligible = new Set(
-      scanCanonicalSessionFactsFromDatabase(database).facts.map((fact) => fact.sessionKey),
+      scanCanonicalSessionFactsFromDatabase(database)
+        .facts.filter((fact) => fact.kind === "session")
+        .map((fact) => fact.sessionKey),
     );
     let count = 0;
     for (const row of iterateSqliteQuerySync(database.db, canonicalRepairQuery(database))) {
