@@ -486,10 +486,26 @@ describe("node worker environment lifetime", () => {
           }),
         );
         readOwner.mockRestore();
-        vi.spyOn(
-          NodeWorkerWorkspaceProcesses.prototype,
-          operation === "environment stop" ? "stopEnvironment" : "close",
-        ).mockRejectedValueOnce(cleanupError);
+        if (operation === "environment stop") {
+          const stop = NodeWorkerWorkspaceProcesses.prototype.stopEnvironment;
+          vi.spyOn(
+            NodeWorkerWorkspaceProcesses.prototype,
+            "stopEnvironment",
+          ).mockImplementationOnce(function (
+            this: NodeWorkerWorkspaceProcesses,
+            input,
+            stopExecution,
+          ) {
+            return stop.call(this, input, async () => {
+              await stopExecution?.();
+              throw cleanupError;
+            });
+          });
+        } else {
+          vi.spyOn(NodeWorkerWorkspaceProcesses.prototype, "close").mockRejectedValueOnce(
+            cleanupError,
+          );
+        }
         const stopping =
           operation === "environment stop"
             ? supervisor.stopEnvironment(testNodeWorkerEnvironmentIdentity(first))
@@ -532,6 +548,8 @@ describe("node worker environment lifetime", () => {
           expect(capacitySnapshots.at(-1)).toEqual({ total: 2, available: 1 });
           expect(inspectNodeWorkerProcessIdentity(unrelated.worker!)).toBe("live");
           expect(await supervisor.status(sibling.launchId)).toMatchObject({ state: "running" });
+          await expect(supervisor.launch(next, TEST_WORKER_ENDPOINT)).rejects.toThrow("retired");
+          await supervisor.stopEnvironment(testNodeWorkerEnvironmentIdentity(first));
           await expect(supervisor.launch(next, TEST_WORKER_ENDPOINT)).resolves.toMatchObject({
             state: "running",
           });

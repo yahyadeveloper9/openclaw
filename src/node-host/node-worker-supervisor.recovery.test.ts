@@ -256,7 +256,7 @@ describe("node worker supervisor recovery", () => {
                 testWorkerLaunchInput(workspaceDir, "fenced-during-recovery"),
                 TEST_WORKER_ENDPOINT,
               ),
-            ).rejects.toThrow("node worker environment is stopping");
+            ).rejects.toThrow("retired");
             process.kill(anchor.pid, "SIGCONT");
             await closing;
             expect(inspectOwnedNodeWorkerTree(anchor)).toBe("dead");
@@ -629,9 +629,22 @@ describe("node worker supervisor recovery", () => {
             await store.get(replaced.launchId),
           ];
           const cleanupError = new Error("workspace process cleanup failed");
+          const stop = NodeWorkerWorkspaceProcesses.prototype.stopEnvironment;
           const stopWorkspace = vi
             .spyOn(NodeWorkerWorkspaceProcesses.prototype, "stopEnvironment")
-            .mockRejectedValueOnce(cleanupError);
+            .mockImplementationOnce(function (
+              this: NodeWorkerWorkspaceProcesses,
+              input,
+              stopExecution,
+            ) {
+              return stop.call(this, input, async () => {
+                const result = await Promise.allSettled([stopExecution?.()]);
+                const failure = result[0];
+                throw failure?.status === "rejected"
+                  ? new AggregateError([cleanupError, failure.reason], "workspace cleanup failed")
+                  : cleanupError;
+              });
+            });
           const delayed = testWorkerLaunchInput(workspaceDir, "stalled-readiness-launch", "wait");
           const readiness = holdNodeWorkerReadiness(delayed.launchId);
           const admission = supervisor.launch(delayed, TEST_WORKER_ENDPOINT);
@@ -668,7 +681,7 @@ describe("node worker supervisor recovery", () => {
                 testWorkerLaunchInput(workspaceDir, "stop-fenced-launch"),
                 TEST_WORKER_ENDPOINT,
               ),
-            ).rejects.toThrow("environment is stopping");
+            ).rejects.toThrow("retired");
             readiness.release();
             const stopError = await stopping;
             await admission;

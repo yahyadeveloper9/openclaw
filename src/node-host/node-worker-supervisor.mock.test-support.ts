@@ -74,21 +74,21 @@ vi.mock("./node-worker-container-lifecycle.js", () => ({
     remove = mocks.remove;
   },
 }));
-vi.mock("./node-worker-workspace.js", () => ({
-  NodeWorkerWorkspaceRuntime: class {
-    acquirePreparedWorkspace = mocks.acquirePreparedWorkspace;
-    applyRetainSnapshot = mocks.retain;
-    quiescence = {
-      hasActiveWork: () => false,
-      close: mocks.quiescenceClose,
-    };
-    processes = {
-      hasActiveWork: () => false,
-      stopEnvironment: async () => {},
-      close: async () => {},
-    };
-  },
-}));
+vi.mock("./node-worker-workspace.js", async () => {
+  const { NodeWorkerWorkspaceProcesses } = await import("./node-worker-workspace-processes.js");
+  return {
+    NodeWorkerWorkspaceRuntime: class {
+      acquirePreparedWorkspace = mocks.acquirePreparedWorkspace;
+      applyRetainSnapshot = mocks.retain;
+      quiescence = {
+        hasActiveWork: () => false,
+        close: mocks.quiescenceClose,
+      };
+      processes = new NodeWorkerWorkspaceProcesses();
+    },
+  };
+});
+
 vi.mock("./node-worker-process-identity.js", () => ({
   requireNodeWorkerProcessIdentity: (pid: number) => ({ pid, startTime: 1 }),
   inspectNodeWorkerProcessIdentity: mocks.inspectIdentity,

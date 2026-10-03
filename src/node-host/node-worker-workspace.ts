@@ -521,6 +521,7 @@ export class NodeWorkerWorkspaceRuntime {
     signal?: AbortSignal,
     gateway?: NodeWorkerTransferGateway,
   ): Promise<NodeWorkerWorkspaceExecResult> {
+    const assertProcessCurrent = this.processes.captureAdmission(input, input.generation);
     const environmentHash = hashPathComponent(input.environmentId, 16);
     const sessionHash = hashPathComponent(input.sessionId, 32);
     const registered = await this.prepared.store?.find(input.environmentId);
@@ -658,6 +659,9 @@ export class NodeWorkerWorkspaceRuntime {
           return projectWorkspaceOperationResult(workspaceDir, stdout, input.argv);
         }
         if (input.resetWorkspace) {
+          if (input.nativeProcessOwner || input.process) {
+            assertProcessCurrent();
+          }
           // Reset never accepts a caller path: only the identity-derived workspace can be removed.
           fs.rmSync(workspacePath, { recursive: true, force: true });
         }
@@ -701,6 +705,7 @@ export class NodeWorkerWorkspaceRuntime {
         if (input.process) {
           return await this.processes.execute({
             input,
+            assertCurrent: assertProcessCurrent,
             workspaceDir,
             env: commandEnv,
             signal,
@@ -710,6 +715,7 @@ export class NodeWorkerWorkspaceRuntime {
         }
         const result = await this.processes.executeForeground({
           input,
+          assertCurrent: assertProcessCurrent,
           workspaceDir,
           env: commandEnv,
           signal,
